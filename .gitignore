@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.log
+.DS_Store
+
+# Large GWAS files
+*.tsv.gz
+*.csv.gz
+
+# Temporary tunnel files
+cloudflared
+streamlit.log
+streamlit_tunnel.log
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
