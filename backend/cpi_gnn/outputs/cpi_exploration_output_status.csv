@@ -1,0 +1,10 @@
+output_name,file_name,exists,size_KB,path
+CPI exploration summary,cpi_gnn_exploration_summary.md,True,5.16,/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/outputs/cpi_gnn_exploration_summary.md
+Quick training log,run_training_quick_log.txt,True,0.27,/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/outputs/run_training_quick_log.txt
+Quick evaluation log,quick_evaluation_log.txt,True,1.67,/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/outputs/quick_evaluation_log.txt
+Quick evaluation metrics,quick_evaluation_metrics.csv,True,0.17,/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/output/evaluation/quick_evaluation_metrics.csv
+Quick confusion matrix,quick_confusion_matrix.csv,True,0.1,/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/output/evaluation/quick_confusion_matrix.csv
+Quick classification report,quick_classification_report.csv,True,0.4,/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/output/evaluation/quick_classification_report.csv
+Quick test predictions,quick_test_predictions.csv,True,0.71,/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/output/evaluation/quick_test_predictions.csv
+Artesunate SMILES,artesunate_smiles_pubchem.csv,True,0.61,/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/outputs/artesunate_smiles_pubchem.csv
+Candidate protein target template,candidate_protein_target_template.csv,True,0.35,/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/outputs/candidate_protein_target_template.csv

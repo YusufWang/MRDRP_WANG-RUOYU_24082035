@@ -1,0 +1,5 @@
+target_name,gene_symbol,uniprot_id,protein_sequence,selection_reason
+SHBG,SHBG,,,MR exposure candidate; related to sex hormone-binding globulin biology.
+GDF15,GDF15,,,MR exposure candidate; growth differentiation factor 15.
+IGF1,IGF1,,,MR exposure candidate; insulin-like growth factor 1.
+ADIPOQ,ADIPOQ,,,MR exposure candidate; adiponectin-related biology.
