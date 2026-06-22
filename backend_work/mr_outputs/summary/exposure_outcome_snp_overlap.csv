@@ -1,0 +1,3 @@
+trait,exposure_snps,outcome_snps,overlap_snps,example_overlap
+GDF15,81,70453,2,19:18264536
+SHBG,8,70453,5,17:7387376

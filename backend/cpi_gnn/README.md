@@ -1,0 +1,1 @@
+This folder is reserved for lightweight CPI/GNN exploration summaries and selected adapted scripts. Large training datasets, model checkpoints, and full experimental outputs are not included in the GitHub deployment package.

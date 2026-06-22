@@ -1,0 +1,3 @@
+trait,status,input_variants,clumped_variants,method,output_file,error
+GDF15,success,79,2,"TwoSampleMR.clump_data kb=10000, r2=0.001, pop=EUR",/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/ld_clumping/ld_clumped_significant_variants/GDF15_ld_clumped_variants.csv,
+SHBG,success,8,1,"TwoSampleMR.clump_data kb=10000, r2=0.001, pop=EUR",/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/ld_clumping/ld_clumped_significant_variants/SHBG_ld_clumped_variants.csv,

@@ -1,0 +1,3 @@
+trait,status,harmonised_snps,result_rows,error
+GDF15,success,2,1,
+SHBG,success,5,5,

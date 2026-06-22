@@ -1,0 +1,3 @@
+trait,file,rows,columns,rsid_like_count,non_rsid_count,has_chr,has_pos,has_ea,has_oa,min_p,example_snp
+GDF15,/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/significant_variants/GDF15_full_sig_variants.csv,81,"SNP, CHR, POS, EA, OA, BETA, SE, EAF, P, N",0,81,True,True,True,True,1.67e-105,19:18388639:T:G; 19:18290081:A:C; 19:18202348:T:C; 19:18249079:A:G; 19:18135235:T:C
+SHBG,/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/significant_variants/SHBG_full_sig_variants.csv,8,"SNP, CHR, POS, EA, OA, BETA, SE, EAF, P, N",0,8,True,True,True,True,2.22507e-307,17:7631360:T:C; 17:7633269:A:G; 17:7631691:T:G; 17:7770907:T:G; 17:7818933:T:C

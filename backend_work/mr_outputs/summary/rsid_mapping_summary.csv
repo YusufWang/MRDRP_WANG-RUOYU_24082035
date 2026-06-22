@@ -1,0 +1,3 @@
+trait,input_file,mapped_output_file,total_variants,mapped_rsid_count,already_rsid_count,mapped_by_chr_pos_count,not_mapped_count,mapping_rate
+GDF15,/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/significant_variants/GDF15_full_sig_variants.csv,/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/ld_clumping/rsid_mapping/GDF15_significant_variants_rsid_mapping.csv,81,79,0,79,2,0.9753086419753086
+SHBG,/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/significant_variants/SHBG_full_sig_variants.csv,/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/ld_clumping/rsid_mapping/SHBG_significant_variants_rsid_mapping.csv,8,8,0,8,0,1.0

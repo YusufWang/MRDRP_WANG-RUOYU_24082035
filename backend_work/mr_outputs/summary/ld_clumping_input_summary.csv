@@ -1,0 +1,3 @@
+trait,ld_input_file,variants_for_clumping,min_pval_exposure,status
+GDF15,/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/ld_clumping/ld_input_significant_variants/GDF15_ld_clump_input.csv,79,1.67e-105,ready_for_clumping
+SHBG,/content/drive/MyDrive/UM_WQF7023/MRDRP-main/backend_work/ld_clumping/ld_input_significant_variants/SHBG_ld_clump_input.csv,8,2.22507e-307,ready_for_clumping

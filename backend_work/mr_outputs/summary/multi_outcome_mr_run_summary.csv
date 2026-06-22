@@ -1,0 +1,19 @@
+set_name,trait,status,harmonised_snps,result_rows,error
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_01,GDF15,success,2,1,
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_01,SHBG,success,5,5,
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_02,GDF15,success,2,1,
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_02,SHBG,success,6,5,
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_03,GDF15,success,2,1,
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_03,SHBG,success,7,5,
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_04,GDF15,failed,0,0,"Error in format_data(as.data.frame(outcome_dat), type = ""outcome"", snps = snps,  : 
+  No SNPs specified for the exposure are present in the outcome dataset.
+"
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_04,SHBG,failed,0,0,"Error in format_data(as.data.frame(outcome_dat), type = ""outcome"", snps = snps,  : 
+  No SNPs specified for the exposure are present in the outcome dataset.
+"
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_05,GDF15,failed,0,0,"Error in format_data(as.data.frame(outcome_dat), type = ""outcome"", snps = snps,  : 
+  No SNPs specified for the exposure are present in the outcome dataset.
+"
+Artesunate_EndometrialCancer_GRCh38_OutcomeCompare_05,SHBG,failed,0,0,"Error in format_data(as.data.frame(outcome_dat), type = ""outcome"", snps = snps,  : 
+  No SNPs specified for the exposure are present in the outcome dataset.
+"
