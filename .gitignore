@@ -17,3 +17,11 @@ streamlit_tunnel.log
 *.pt
 *.pth
 *.ckpt
+exposures/
+outcome/
+backend_work/
+_local_scratch/
+__pycache__/
+*.pyc
+analysis_set_record.csv
+artesunate_file_screening_record*.csv

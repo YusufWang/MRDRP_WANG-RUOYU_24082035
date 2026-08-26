@@ -1,12 +1,18 @@
-
 import os
 import re
 import shutil
 import hashlib
+import gzip
+import json
+import subprocess
+import sys
+import time
+import io
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
 
@@ -280,6 +286,17 @@ OUTCOME_DIR = PROJECT_ROOT / "outcome"
 TARGET_RECORD_FILE = PROJECT_ROOT / "artesunate_file_screening_record.csv"
 ANALYSIS_SET_RECORD_FILE = PROJECT_ROOT / "analysis_set_record.csv"
 
+# Local (non-Drive-mounted) scratch space for large downloads and Drive-I/O
+# workarounds. /content is Colab-specific and doesn't exist -- and isn't
+# creatable by a non-root user -- on a regular server; confirmed 2026-08-13
+# as a real PermissionError on the Linux deployment. Same auto-detect
+# pattern as PROJECT_ROOT above.
+if COLAB_PROJECT_ROOT.exists():
+    LOCAL_SCRATCH_DIR = Path("/content")
+else:
+    LOCAL_SCRATCH_DIR = PROJECT_ROOT / "_local_scratch"
+LOCAL_SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # =========================================================
 # CPI / GNN exploration output paths
@@ -309,6 +326,15 @@ CPI_QUICK_TEST_PREDICTIONS_FILE = CPI_EVALUATION_DIR / "quick_test_predictions.c
 CPI_ARTESUNATE_SMILES_FILE = CPI_OUTPUT_ROOT / "artesunate_smiles_pubchem.csv"
 CPI_CANDIDATE_TARGET_TEMPLATE_FILE = CPI_OUTPUT_ROOT / "candidate_protein_target_template.csv"
 
+# P2 additions: real Artesunate-target inference, 3D conformer data.
+CPI_TARGET_PREDICTIONS_FILE = CPI_OUTPUT_ROOT / "artesunate_target_predictions.csv"
+CPI_HOLDOUT_MANIFEST_FILE = CPI_OUTPUT_ROOT / "p2_holdout_manifest.csv"
+CPI_P2_TRAINING_LOG_FILE = CPI_OUTPUT_ROOT / "p2_training_log.txt"
+CPI_3D_CONFORMER_SDF_FILE = CPI_OUTPUT_ROOT / "artesunate_3d_conformer.sdf"
+CPI_3D_CONFORMER_METADATA_FILE = CPI_OUTPUT_ROOT / "artesunate_3d_conformer_metadata.csv"
+CPI_3D_COORDS_FILE = CPI_OUTPUT_ROOT / "artesunate_3d_heavy_atom_coords.csv"
+
+
 # Global counter for CPI download buttons.
 # This prevents duplicate Streamlit keys when the same CPI file is shown in multiple tabs.
 CPI_DOWNLOAD_BUTTON_COUNTER = 0
@@ -332,6 +358,7 @@ def make_unique_download_key(prefix: str, label: str, file_name: str):
 
 
 BACKEND_ROOT = PROJECT_ROOT / "backend_work"
+MR_ANALYSIS_LAUNCHER_SCRIPT = PROJECT_ROOT / "run_mr_analysis_for_set.py"
 MR_OUTPUT_ROOT = BACKEND_ROOT / "mr_outputs"
 MR_SUMMARY_DIR = MR_OUTPUT_ROOT / "summary"
 
@@ -410,9 +437,46 @@ def read_preview_safely(file_path: Path, nrows: int = 5):
     try:
         return pd.read_csv(file_path, sep=sep, compression=compression, nrows=nrows)
     except OSError:
-        local_path = Path("/content") / file_path.name
+        local_path = LOCAL_SCRATCH_DIR / file_path.name
         shutil.copy2(file_path, local_path)
         return pd.read_csv(local_path, sep=sep, compression=compression, nrows=nrows)
+
+
+def format_file_size(num_bytes):
+    if num_bytes is None:
+        return "Unknown"
+    size = float(num_bytes)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size < 1024.0:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
+def count_file_rows(file_path: Path):
+    compression = infer_compression(file_path.name)
+    opener = gzip.open if compression == "gzip" else open
+    with opener(file_path, "rt", encoding="utf-8", errors="replace") as f:
+        return max(sum(1 for _ in f) - 1, 0)  # -1 for the header row, floor at 0
+
+
+@st.cache_data(show_spinner=False)
+def _cached_file_size_and_rows(file_path_str: str, mtime: float):
+    # mtime is part of the cache key purely so this invalidates correctly
+    # if the file is ever re-saved with different content at the same path.
+    file_path = Path(file_path_str)
+    size_str = format_file_size(file_path.stat().st_size)
+    try:
+        row_count = count_file_rows(file_path)
+    except Exception:
+        row_count = None
+    return size_str, row_count
+
+
+@st.cache_data(show_spinner="Reading full file for download...")
+def _cached_read_file_bytes(file_path_str: str, mtime: float) -> bytes:
+    # Same mtime-in-cache-key rationale as _cached_file_size_and_rows above.
+    return Path(file_path_str).read_bytes()
 
 
 def get_build_from_filename(file_name: str):
@@ -502,15 +566,46 @@ def inspect_columns(columns):
     if effect_size_column is None:
         missing_core.append("effect_size")
 
+    # standard_error and p_value can each be derived from the other + the
+    # effect size when exactly one of them is missing -- see
+    # se_from_pvalue()/p_from_beta_se() in mr_pipeline.py (z = beta/SE,
+    # p = 2*(1-Phi(|z|)), invertible either direction since neither
+    # direction needs to recover a sign that isn't already there). If BOTH
+    # are missing, neither is derivable -- deriving beta from SE+P is
+    # deliberately NOT supported, since a two-tailed p-value only carries
+    # |z|, never its sign, so that direction could only ever guess beta's
+    # sign, risking a silently flipped causal direction.
+    se_derivable = (
+        found_map["standard_error"] is None
+        and found_map["p_value"] is not None
+        and effect_size_column is not None
+    )
+    p_derivable = (
+        found_map["p_value"] is None
+        and found_map["standard_error"] is not None
+        and effect_size_column is not None
+    )
+    if se_derivable and "standard_error" in missing_core:
+        missing_core.remove("standard_error")
+    if p_derivable and "p_value" in missing_core:
+        missing_core.remove("p_value")
+
     full_summary_stats_candidate = "Yes" if len(missing_core) == 0 else "No"
 
     if len(missing_core) == 0:
+        adaptation_reasons = []
         if effect_size_type == "odds_ratio":
+            adaptation_reasons.append("effect size is odds_ratio (needs beta = log(odds_ratio))")
+        if se_derivable:
+            adaptation_reasons.append("standard_error missing but derivable from p_value (SE = |beta| / z)")
+        if p_derivable:
+            adaptation_reasons.append("p_value missing but derivable from standard_error (p = 2*(1-Phi(|beta/SE|)))")
+        if found_map["variant_identifier"] is None:
+            adaptation_reasons.append("no obvious rsID/SNP-like identifier column")
+
+        if adaptation_reasons:
             status = "Needs adaptation"
-            notes = "Effect size is represented as odds_ratio. Beta should be derived using beta = log(odds_ratio) before MR analysis."
-        elif found_map["variant_identifier"] is None:
-            status = "Needs adaptation"
-            notes = "Core MR fields found, but no obvious rsID/SNP-like identifier column."
+            notes = "; ".join(adaptation_reasons) + ". Applied automatically."
         else:
             status = "Suitable candidate"
             notes = "Core MR fields found; variant identifier present."
@@ -530,6 +625,12 @@ def scan_single_file(file_record, preview_rows=5):
     columns = df_small.columns.tolist()
 
     found_map, full_summary_stats_candidate, status, notes = inspect_columns(columns)
+
+    file_size_str = format_file_size(file_path.stat().st_size) if file_path.exists() else "Unknown"
+    try:
+        row_count = count_file_rows(file_path)
+    except Exception:
+        row_count = None
 
     record = {
         "file_name": file_path.name,
@@ -553,7 +654,9 @@ def scan_single_file(file_record, preview_rows=5):
         "sample_size": found_map["sample_size"],
         "full_summary_stats_candidate": full_summary_stats_candidate,
         "status": status,
-        "notes": notes
+        "notes": notes,
+        "file_size": file_size_str,
+        "row_count": row_count
     }
 
     return df_small, record
@@ -582,7 +685,9 @@ def ensure_record_columns(df):
         "sample_size",
         "full_summary_stats_candidate",
         "status",
-        "notes"
+        "notes",
+        "file_size",
+        "row_count"
     ]
 
     for col in required_columns:
@@ -697,10 +802,53 @@ def canonical_trait_name(trait):
     return key
 
 
+def rank_measurement_first(df, reference_term, name_col="trait_name"):
+    """
+    Move rows whose name_col is exactly "<reference_term> measurement"
+    (case/whitespace-insensitive, nothing else attached) to the top.
+
+    EFO trait names for standard quantitative biomarkers typically follow
+    this "X measurement" convention for the plain, population-level GWAS of
+    X -- as opposed to "X measurement in response to statin therapy" or
+    "X measurement adjusted for BMI" style variants, which are specialised
+    subgroup/interaction studies. The plain version is usually what's
+    wanted for MR instrument selection, but the GWAS Catalog's own search
+    ordering doesn't prioritise it -- confirmed 2026-08-05: searching
+    "triglyceride" or "TG" alone did not surface "triglyceride measurement"
+    in the first 20 results, even though it was present further down.
+
+    Stable sort -- rows that don't match keep their existing relative order.
+    """
+    if len(df) == 0 or name_col not in df.columns or not str(reference_term or "").strip():
+        return df
+
+    term_norm = re.sub(r"\s+", " ", str(reference_term).strip().lower())
+    target = f"{term_norm} measurement"
+
+    def _priority(name):
+        name_norm = re.sub(r"\s+", " ", str(name).strip().lower())
+        return 0 if name_norm == target else 1
+
+    df = df.copy()
+    df["_measurement_priority"] = df[name_col].apply(_priority)
+    df = df.sort_values("_measurement_priority", kind="stable").drop(columns=["_measurement_priority"])
+    return df
+
+
 def make_file_label(row):
+    file_size = row.get("file_size", "")
+    file_size_str = str(file_size).strip() if file_size not in (None, "") and str(file_size).lower() != "nan" else "size unknown"
+
+    row_count = row.get("row_count", "")
+    try:
+        row_count_str = f"{int(float(row_count)):,} rows"
+    except (TypeError, ValueError):
+        row_count_str = "rows unknown"
+
     return (
         f'{row.get("file_name", "")} '
-        f'({row.get("trait", "")}, {row.get("build", "")}, {row.get("status", "")})'
+        f'({row.get("trait", "")}, {row.get("build", "")}, {row.get("status", "")}, '
+        f'{file_size_str}, {row_count_str})'
     )
 
 
@@ -863,10 +1011,11 @@ page = st.sidebar.radio(
     "Go to",
     [
         "Home",
+        "GWAS Catalog Search",
         "Targeted File Screening",
         "Analysis Set Selection",
         "Backend MR Results",
-        "MR Pipeline + LD Clumping",
+        "MR Pipeline + LD Clumping (P1 legacy)",
         "CPI / GNN Exploration"
     ],
     index=0
@@ -926,14 +1075,9 @@ if page == "Home":
 
     st.markdown(
         """
-        **Target exposures**
-        - IGF-1 / insulin-like growth factor 1
-        - SHBG / sex hormone-binding globulin
-        - Adiponectin / ADIPOQ
-        - GDF-15 / growth differentiation factor 15
-
-        **Target outcome**
-        - Endometrial cancer
+        This started as a case study around a specific set of exposures and one outcome (see the sample
+        folder layout on the **Targeted File Screening** page), but the dashboard now supports searching
+        and pulling data for **any** exposure-outcome pair directly via the **GWAS Catalog Search** page.
         """
     )
 
@@ -985,6 +1129,771 @@ if page == "Home":
 
 
 # =========================================================
+# GWAS Catalog Search (P2 addition)
+# =========================================================
+elif page == "GWAS Catalog Search":
+    st.title("🔎 GWAS Catalog Search")
+    st.caption("Search the official GWAS Catalog by keyword, inspect candidate studies, and pull ready-to-use exposure/outcome files directly from the API.")
+
+    try:
+        import gwas_catalog_client
+    except ImportError:
+        st.error(
+            "gwas_catalog_client.py was not found next to app.py. "
+            "Please add it to the MRDRP-main/ folder and rerun."
+        )
+        st.stop()
+
+    @st.cache_data(ttl=3600, show_spinner="Searching EFO traits (with abbreviation/synonym fallback)...")
+    def _cached_search_efo_traits(keyword: str, size: int = 100):
+        return gwas_catalog_client.search_efo_traits_with_fallback(keyword, size=size)
+
+
+    @st.cache_data(ttl=3600, show_spinner="Listing studies...")
+    def _cached_search_studies(efo_id: str, efo_uri: str, size: int = 100):
+        return gwas_catalog_client.search_studies(efo_trait=efo_id, efo_uri=efo_uri, size=size)
+
+    @st.cache_data(ttl=3600, show_spinner="Searching studies directly by disease name...")
+    def _cached_search_studies_by_disease_trait(disease_trait: str, size: int = 100):
+        return gwas_catalog_client.search_studies(disease_trait=disease_trait, size=size)
+
+    @st.cache_data(ttl=3600, show_spinner="Checking summary statistics availability...")
+    def _cached_check_summary_stats(accession: str):
+        return gwas_catalog_client.check_summary_stats_available(accession)
+
+    @st.cache_data(ttl=1800, show_spinner="Pulling significant variants from GWAS Catalog...")
+    def _cached_fetch_significant(accession: str, p_upper: float):
+        return gwas_catalog_client.fetch_significant_associations(accession, p_upper=p_upper)
+
+    st.info(
+        "This page talks to two separate EBI APIs: the main GWAS Catalog API (for keyword "
+        "search and study metadata) and the Summary Statistics API (for the actual variant "
+        "numbers). See gwas_catalog_client.py for details. If a search comes back empty when "
+        "you expect results, check the 'show raw response' option below before assuming "
+        "nothing matched -- this integration has not yet been run against the live API."
+    )
+
+    st.markdown("---")
+
+    # -------------------------------------------------------------------
+    # Step 1: keyword -> EFO trait candidates
+    # -------------------------------------------------------------------
+    st.subheader("1) Search for a trait")
+
+    keyword = st.text_input(
+        "Exposure or outcome keyword (e.g. 'endometrial cancer', 'IGF1', 'adiponectin')",
+        value=""
+    )
+    show_raw = st.checkbox("Show raw API response for debugging", value=False)
+
+    if st.button("Search traits") and keyword.strip():
+        try:
+            traits_df = _cached_search_efo_traits(keyword.strip())
+            st.session_state["gwas_search_traits_df"] = traits_df
+            st.session_state["gwas_search_keyword"] = keyword.strip()
+        except gwas_catalog_client.GwasCatalogRateLimitError as e:
+            st.error(
+                "Hit the GWAS Catalog API's rate limit while searching traits. Please wait "
+                "before trying again. "
+                + (f"Retry-After: {e.retry_after}" if e.retry_after else "")
+            )
+        except gwas_catalog_client.GwasCatalogAPIError as e:
+            st.warning(
+                f"The GWAS Catalog API returned an error searching for '{keyword.strip()}' "
+                f"(most likely a temporary problem on EBI's end, not something wrong with your "
+                f"setup): {e}. Try again in a moment."
+            )
+
+    traits_df = st.session_state.get("gwas_search_traits_df", pd.DataFrame())
+
+    if len(traits_df) > 0:
+        # Rank exact "<term> measurement" traits first -- use whichever term
+        # actually produced these results (the raw keyword, or the
+        # abbreviation/synonym fallback's successful query if that's what
+        # it took), so this still works when the keyword itself was e.g. "TG".
+        search_log_for_ranking = getattr(traits_df, "attrs", {}).get("search_log")
+        ranking_term = (
+            search_log_for_ranking[-1]["query"] if search_log_for_ranking else keyword.strip()
+        )
+        traits_df = rank_measurement_first(traits_df, ranking_term)
+
+        display_cols = [c for c in ["efo_id", "trait_name", "uri"] if c in traits_df.columns]
+
+        PAGE_SIZE = 20
+        total_traits = len(traits_df)
+        total_pages = max(1, (total_traits - 1) // PAGE_SIZE + 1)
+        if total_pages > 1:
+            trait_page = st.number_input(
+                f"Page (1-{total_pages}, {total_traits} total traits)",
+                min_value=1, max_value=total_pages, value=1, step=1,
+                key="gwas_search_traits_page"
+            )
+        else:
+            trait_page = 1
+        page_start = (trait_page - 1) * PAGE_SIZE
+        page_end = page_start + PAGE_SIZE
+        st.dataframe(traits_df[display_cols].iloc[page_start:page_end], use_container_width=True)
+        if total_pages > 1:
+            st.caption(f"Showing {page_start + 1}-{min(page_end, total_traits)} of {total_traits} traits.")
+
+        # search_efo_traits_with_fallback() records every strategy it tried in
+        # .attrs["search_log"] -- a log with more than one entry means the
+        # literal keyword search came up empty and a fallback (local alias
+        # table, EBI OLS synonym lookup, or a loosened query) found the match
+        # instead. Surfaced here so it is never a silent substitution.
+        search_log = getattr(traits_df, "attrs", {}).get("search_log")
+        if search_log and len(search_log) > 1:
+            successful_attempt = search_log[-1]
+            st.caption(
+                f"Direct keyword search for '{keyword.strip()}' came up empty -- found this via "
+                f"fallback strategy '{successful_attempt['strategy']}' "
+                f"(retried query: '{successful_attempt['query']}')."
+            )
+            with st.expander("Search fallback attempts (for troubleshooting)", expanded=False):
+                st.dataframe(pd.DataFrame(search_log), use_container_width=True)
+
+        if show_raw:
+            with st.expander("Raw trait search response (first result)", expanded=False):
+                st.json(traits_df.iloc[0].get("_raw", {}))
+    elif "gwas_search_keyword" in st.session_state:
+        st.warning(
+            "No traits matched, even after retrying with known abbreviations/synonyms and "
+            "EBI's Ontology Lookup Service. Try a different keyword, or use the EFO ID / GCST "
+            "accession escape hatch below if you already know one."
+        )
+        search_log = getattr(traits_df, "attrs", {}).get("search_log")
+        if search_log:
+            with st.expander("Search fallback attempts (for troubleshooting)", expanded=show_raw):
+                st.dataframe(pd.DataFrame(search_log), use_container_width=True)
+
+    with st.expander("Already know the EFO ID or GCST accession? Skip the trait search"):
+        st.caption(
+            "If keyword search still misses -- or you already have a specific EFO ID (e.g. from "
+            "the EBI website or a paper) or a specific GCST study accession in mind -- enter it "
+            "here to jump straight past the keyword search above."
+        )
+        escape_col1, escape_col2 = st.columns(2)
+
+        with escape_col1:
+            manual_efo_id = st.text_input(
+                "EFO ID (e.g. EFO_0004340 or EFO:0004340)",
+                value="",
+                key="gwas_manual_efo_id"
+            )
+            if st.button("Use this EFO ID directly", key="gwas_manual_efo_id_button") and manual_efo_id.strip():
+                normalised_efo_id = manual_efo_id.strip().replace(":", "_")
+                manual_traits_df = pd.DataFrame([{
+                    "efo_id": normalised_efo_id,
+                    "trait_name": f"(manually entered: {normalised_efo_id})",
+                    "uri": None,
+                }])
+                st.session_state["gwas_search_traits_df"] = manual_traits_df
+                st.session_state["gwas_search_keyword"] = f"[manual EFO ID] {normalised_efo_id}"
+                st.rerun()
+
+        with escape_col2:
+            manual_accession = st.text_input(
+                "GCST study accession (e.g. GCST90104597)",
+                value="",
+                key="gwas_manual_accession"
+            )
+            if st.button("Look up this accession directly", key="gwas_manual_accession_button") and manual_accession.strip():
+                accession_clean = manual_accession.strip()
+                try:
+                    with st.spinner(f"Looking up {accession_clean}..."):
+                        manual_studies_df = gwas_catalog_client.search_studies(accession_id=accession_clean, size=5)
+                    if len(manual_studies_df) == 0:
+                        st.error(f"No study found for accession '{accession_clean}'. Double-check the accession and try again.")
+                    else:
+                        manual_efo_key = f"MANUAL:{accession_clean}"
+                        manual_trait_name = manual_studies_df.iloc[0].get("trait_name") or f"(manually entered: {accession_clean})"
+                        manual_traits_df = pd.DataFrame([{
+                            "efo_id": manual_efo_key,
+                            "trait_name": manual_trait_name,
+                            "uri": None,
+                        }])
+                        st.session_state["gwas_search_traits_df"] = manual_traits_df
+                        st.session_state["gwas_search_keyword"] = f"[manual accession] {accession_clean}"
+                        st.session_state["gwas_search_studies_df"] = manual_studies_df
+                        st.session_state["gwas_search_studies_efo_id"] = manual_efo_key
+                        st.rerun()
+                except gwas_catalog_client.GwasCatalogRateLimitError as e:
+                    st.error(
+                        "Hit the GWAS Catalog API's rate limit looking up this accession. Please "
+                        "wait before trying again. "
+                        + (f"Retry-After: {e.retry_after}" if e.retry_after else "")
+                    )
+                except gwas_catalog_client.GwasCatalogAPIError as e:
+                    st.warning(
+                        f"The GWAS Catalog API returned an error looking up '{accession_clean}' "
+                        f"(most likely a temporary problem on EBI's end): {e}. Try the button below "
+                        "instead, or the manual FTP route further down the page."
+                    )
+
+            st.caption(
+                "If the button above also fails, it's because it still depends on the same "
+                "Main API v2 service as trait search. The button below skips that service "
+                "entirely and goes straight to checking summary stats / FTP for this accession "
+                "-- those are separate EBI services and have a real chance of working even when "
+                "Main API v2 itself is down (confirmed 2026-08-21: this was the case during a "
+                "real outage where both /efo-traits and /studies were failing)."
+            )
+            if st.button("Skip metadata lookup, use this accession directly", key="gwas_manual_accession_bypass_button") and manual_accession.strip():
+                accession_clean = manual_accession.strip()
+                bypass_efo_key = f"MANUAL:{accession_clean}"
+                bypass_traits_df = pd.DataFrame([{
+                    "efo_id": bypass_efo_key,
+                    "trait_name": f"(manually entered, metadata not looked up: {accession_clean})",
+                    "uri": None,
+                }])
+                bypass_studies_df = pd.DataFrame([{
+                    "accession": accession_clean,
+                    "trait_name": None,
+                    "disease_trait": None,
+                    "pubmed_id": None,
+                    "sample_size": None,
+                    "has_summary_stats": None,
+                    "snp_count": None,
+                    "cohort": None,
+                }])
+                st.session_state["gwas_search_traits_df"] = bypass_traits_df
+                st.session_state["gwas_search_keyword"] = f"[manual accession, no metadata lookup] {accession_clean}"
+                st.session_state["gwas_search_studies_df"] = bypass_studies_df
+                st.session_state["gwas_search_studies_efo_id"] = bypass_efo_key
+                st.rerun()
+
+    with st.expander("Still stuck? Emergency bulk keyword search (bypasses Main API v2 entirely)"):
+        st.warning(
+            "Use this only if trait/study search above isn't working. It downloads EBI's full "
+            "studies metadata file directly -- a bulk TSV export, a completely different service "
+            "from the Main API v2 REST endpoints everything above depends on -- and searches it "
+            "locally by keyword. This has a real chance of working during a Main API v2 outage, "
+            "the same way the FTP archive and Summary Statistics API do."
+        )
+        st.caption(
+            "**Limitations:** this is a blunt substring match against the raw DISEASE/TRAIT field, "
+            "not a validated EFO trait lookup, so results can include loosely related studies and "
+            "the same study can appear more than once if it's mapped to multiple trait labels. It "
+            "also cannot tell you whether a given accession actually has full summary statistics "
+            "available -- use 'Skip metadata lookup, use this accession directly' above (or the "
+            "manual FTP check further down this page) to verify each candidate before committing "
+            "to it. The exact download URL and column names were not verified against a live "
+            "response while EBI's outage was ongoing -- if this errors out, the URL or column "
+            "names may need a small update once Main API v2 (or a stable connection) is back."
+        )
+
+        bulk_keyword = st.text_input(
+            "Keyword to search (also tries any known full name/synonym for it, e.g. 'IGF1' also "
+            "searches 'insulin-like growth factor 1')",
+            value="", key="gwas_bulk_search_keyword",
+        )
+
+        @st.cache_data(ttl=86400, show_spinner="Downloading EBI's full studies metadata file (~100-200MB, can take a minute)...")
+        def _cached_download_bulk_studies():
+            url = "https://www.ebi.ac.uk/gwas/api/search/downloads/studies_alternative"
+            resp = requests.get(url, timeout=180)
+            resp.raise_for_status()
+            return pd.read_csv(io.StringIO(resp.text), sep="\t", low_memory=False)
+
+        if st.button("Search bulk studies file", key="gwas_bulk_search_button") and bulk_keyword.strip():
+            try:
+                bulk_studies_df = _cached_download_bulk_studies()
+            except Exception as e:
+                st.error(f"Could not download or parse the bulk studies file: {e}")
+                bulk_studies_df = None
+
+            if bulk_studies_df is not None:
+                trait_col = next(
+                    (c for c in bulk_studies_df.columns
+                     if c.strip().upper().replace(" ", "").replace("/", "") == "DISEASETRAIT"),
+                    None,
+                )
+                accession_col = next(
+                    (c for c in bulk_studies_df.columns
+                     if c.strip().upper().replace(" ", "").replace("_", "") == "STUDYACCESSION"),
+                    None,
+                )
+
+                if trait_col is None or accession_col is None:
+                    st.error(
+                        "Expected a DISEASE/TRAIT-like and a STUDY ACCESSION-like column in the "
+                        f"downloaded file, but couldn't find them. Columns present: "
+                        f"{list(bulk_studies_df.columns)}"
+                    )
+                else:
+                    search_terms = [bulk_keyword.strip()] + gwas_catalog_client._alias_expansions_for(bulk_keyword.strip())
+                    search_terms = list(dict.fromkeys(search_terms))  # dedupe, keep order
+
+                    mask = pd.Series(False, index=bulk_studies_df.index)
+                    for term in search_terms:
+                        mask = mask | bulk_studies_df[trait_col].astype(str).str.contains(term, case=False, na=False, regex=False)
+                    bulk_matches = bulk_studies_df[mask].copy()
+
+                    st.caption(f"Searched for: {', '.join(repr(t) for t in search_terms)}")
+                    st.write(f"**{len(bulk_matches)} row(s) found**")
+
+                    if len(bulk_matches) == 0:
+                        st.info("No matches. Try a different spelling, or one of the alias forms directly.")
+                    else:
+                        display_cols = [
+                            c for c in [accession_col, trait_col, "FIRST AUTHOR", "PUBMEDID", "INITIAL SAMPLE SIZE"]
+                            if c in bulk_matches.columns
+                        ]
+                        bulk_display_df = bulk_matches[display_cols].drop_duplicates()
+                        st.dataframe(bulk_display_df, use_container_width=True)
+                        st.download_button(
+                            "Download these matches as CSV",
+                            data=bulk_display_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"bulk_search_{re.sub(r'[^A-Za-z0-9]+', '_', bulk_keyword.strip())}.csv",
+                            mime="text/csv",
+                            key="gwas_bulk_search_download",
+                        )
+                        st.caption(
+                            "Copy an accession from the table above into 'GCST study accession' in the "
+                            "expander above, then use 'Skip metadata lookup, use this accession "
+                            "directly' to proceed."
+                        )
+
+    # -------------------------------------------------------------------
+    # Step 2: chosen trait -> studies with that trait
+    # -------------------------------------------------------------------
+    st.subheader("2) List studies for a trait")
+
+
+    if len(traits_df) == 0:
+        st.info("Search for a trait above first.")
+    else:
+        trait_options = [
+            f'{row.get("trait_name", "")} ({row.get("efo_id", "")})'
+            for _, row in traits_df.iterrows()
+        ]
+        selected_trait_label = st.selectbox("Choose a trait", trait_options)
+        selected_trait_row = traits_df.iloc[trait_options.index(selected_trait_label)]
+        selected_efo_id = selected_trait_row.get("efo_id")
+
+        if st.button("List studies for this trait") and selected_efo_id:
+            try:
+                studies_df = _cached_search_studies(selected_efo_id, selected_trait_row.get("uri"))
+                st.session_state["gwas_search_studies_df"] = studies_df
+                st.session_state["gwas_search_studies_efo_id"] = selected_efo_id
+            except gwas_catalog_client.GwasCatalogRateLimitError as e:
+                st.error(
+                    "Hit the GWAS Catalog API's rate limit while listing studies. Please wait "
+                    "before trying again. "
+                    + (f"Retry-After: {e.retry_after}" if e.retry_after else "")
+                )
+            except gwas_catalog_client.GwasCatalogAPIError as e:
+                st.warning(
+                    f"The GWAS Catalog API returned an error listing studies for this trait "
+                    f"(most likely a temporary problem on EBI's end): {e}. Try again in a moment."
+                )
+
+        studies_df = st.session_state.get("gwas_search_studies_df", pd.DataFrame())
+
+        if len(studies_df) > 0 and st.session_state.get("gwas_search_studies_efo_id") == selected_efo_id:
+            display_studies_df = studies_df.copy()
+
+            ftp_info = st.session_state.get("gwas_search_ftp_info_by_efo", {}).get(selected_efo_id)
+            if ftp_info:
+                display_studies_df["ftp_size"] = display_studies_df["accession"].map(
+                    lambda a: ftp_info.get(a, {}).get("size_str")
+                )
+                display_studies_df["ftp_build"] = display_studies_df["accession"].map(
+                    lambda a: ftp_info.get(a, {}).get("build")
+                )
+
+            if "snp_count" in display_studies_df.columns:
+                filter_by_snp_count = st.checkbox(
+                    "Only show studies with at least 1,000,000 SNPs (helps exclude exome-restricted/narrow-panel studies)",
+                    value=False,
+                    key="gwas_search_min_snp_filter",
+                )
+                if filter_by_snp_count:
+                    before_count = len(display_studies_df)
+                    display_studies_df = display_studies_df[
+                        pd.to_numeric(display_studies_df["snp_count"], errors="coerce") >= 1_000_000
+                    ]
+                    st.caption(
+                        f"Showing {len(display_studies_df)} of {before_count} studies with >=1,000,000 SNPs. "
+                        "A genuinely genome-wide (imputed) study typically has millions of variants; "
+                        "exome-sequencing-derived studies -- even when not labelled 'Gene-based burden' -- "
+                        "often only cover 150,000-550,000 positions (confirmed 2026-08-07 against a real "
+                        "UK Biobank exome batch), since exome sequencing only reads coding regions and "
+                        "misses common intronic/intergenic GWAS hits entirely."
+                    )
+
+            display_cols = [c for c in [
+                "accession", "trait_name", "disease_trait", "sample_size",
+                "has_summary_stats", "ftp_size", "ftp_build", "pubmed_id", "snp_count", "cohort"
+            ] if c in display_studies_df.columns]
+
+            STUDY_PAGE_SIZE = 20
+            total_studies = len(display_studies_df)
+            total_study_pages = max(1, (total_studies - 1) // STUDY_PAGE_SIZE + 1)
+            if total_study_pages > 1:
+                study_page = st.number_input(
+                    f"Page (1-{total_study_pages}, {total_studies} total studies)",
+                    min_value=1, max_value=total_study_pages, value=1, step=1,
+                    key="gwas_search_studies_page"
+                )
+            else:
+                study_page = 1
+            study_page_start = (study_page - 1) * STUDY_PAGE_SIZE
+            study_page_end = study_page_start + STUDY_PAGE_SIZE
+            st.dataframe(display_studies_df[display_cols].iloc[study_page_start:study_page_end], use_container_width=True)
+            if total_study_pages > 1:
+                st.caption(f"Showing {study_page_start + 1}-{min(study_page_end, total_studies)} of {total_studies} studies.")
+
+            try:
+                import gwas_catalog_ftp as _gwas_catalog_ftp_for_sizes
+            except ImportError:
+                _gwas_catalog_ftp_for_sizes = None
+
+            if _gwas_catalog_ftp_for_sizes is not None and not ftp_info:
+                n_studies = len(studies_df)
+                if st.button(f"Check FTP file size/build for these {n_studies} studies"):
+                    progress = st.progress(0.0, text="Checking FTP archive...")
+                    info = {}
+                    accessions = studies_df["accession"].dropna().tolist()
+                    for idx, acc in enumerate(accessions):
+                        try:
+                            info[acc] = _gwas_catalog_ftp_for_sizes.find_best_available_file(acc) or {}
+                        except _gwas_catalog_ftp_for_sizes.GwasFtpError:
+                            info[acc] = {}
+                        progress.progress((idx + 1) / len(accessions), text=f"Checked {idx + 1} / {len(accessions)}")
+                    progress.empty()
+                    all_ftp_info = st.session_state.get("gwas_search_ftp_info_by_efo", {})
+                    all_ftp_info[selected_efo_id] = info
+                    st.session_state["gwas_search_ftp_info_by_efo"] = all_ftp_info
+                    st.rerun()
+
+            if show_raw:
+                with st.expander("Raw study list response (first result)", expanded=False):
+                    st.json(studies_df.iloc[0].get("_raw", {}))
+        elif "gwas_search_studies_efo_id" in st.session_state:
+            st.warning("No studies found for this trait via the API. Try browsing the GWAS Catalog website directly for this trait, or fall back to the manual FTP download route used in P1.")
+            variants_tried = getattr(studies_df, "attrs", {}).get("variants_tried")
+            if variants_tried:
+                with st.expander("Parameter variants tried (for diagnosing an API mismatch)", expanded=show_raw):
+                    st.dataframe(pd.DataFrame(variants_tried), use_container_width=True)
+
+    # -------------------------------------------------------------------
+    # Step 3: chosen study -> preview + save significant variants
+    # -------------------------------------------------------------------
+    st.subheader("3) Preview and save significant variants")
+
+    studies_df = st.session_state.get("gwas_search_studies_df", pd.DataFrame())
+
+    if len(studies_df) == 0 or "accession" not in studies_df.columns:
+        st.info("List studies for a trait above first.")
+    else:
+        accession_options = [a for a in studies_df["accession"].dropna().tolist()]
+        if len(accession_options) == 0:
+            st.warning("No study accessions were parsed from the search results.")
+            st.stop()
+
+        studies_by_accession = studies_df.set_index("accession")
+        current_efo_id = st.session_state.get("gwas_search_studies_efo_id")
+        ftp_info_for_dropdown = st.session_state.get("gwas_search_ftp_info_by_efo", {}).get(current_efo_id, {})
+
+        def _format_accession_option(acc: str) -> str:
+            row = studies_by_accession.loc[acc] if acc in studies_by_accession.index else {}
+            trait = row.get("trait_name") if hasattr(row, "get") else None
+            has_stats = row.get("has_summary_stats") if hasattr(row, "get") else None
+            label = acc
+            if trait:
+                label += f" | {trait}"
+            if has_stats is not None:
+                label += f" | has_summary_stats={has_stats}"
+            ftp = ftp_info_for_dropdown.get(acc)
+            if ftp:
+                label += f" | FTP: {ftp.get('build', '?')}, {ftp.get('size_str') or '?'}"
+            return label
+
+        selected_accession = st.selectbox("Study accession", accession_options, format_func=_format_accession_option)
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            target_role = st.selectbox("Save as", ["exposure", "outcome"])
+        with col_b:
+            target_trait_folder = st.text_input(
+                "Trait folder name",
+                value=canonical_trait_name(
+                    studies_df[studies_df["accession"] == selected_accession].iloc[0].get("trait_name", "")
+                ) or "NewTrait"
+            )
+        with col_c:
+            p_upper = st.number_input(
+                "p-value threshold",
+                min_value=1e-300, max_value=1.0, value=5e-8, format="%.2e"
+            )
+
+        if target_role == "outcome":
+            effective_p_upper = 1.1  # > any real p-value -- effectively "no filtering"
+            st.caption(
+                "Saving as **outcome**: the p-value threshold above is ignored and the full "
+                "(unfiltered) dataset is fetched instead. Outcome data needs to cover whatever "
+                "SNPs end up selected as exposure instruments, regardless of whether they're "
+                "significant for this outcome -- filtering here would miss almost all of them."
+            )
+        else:
+            effective_p_upper = float(p_upper)
+
+        main_catalog_has_stats = studies_df[studies_df["accession"] == selected_accession].iloc[0].get("has_summary_stats")
+        catalog_study_url = f"https://www.ebi.ac.uk/gwas/studies/{selected_accession}"
+
+        # The Summary Statistics API's availability check has been observed
+        # rate-limited to as low as 10 requests/hour. The main catalog's
+        # has_summary_stats flag is free (already fetched in Step 2), so
+        # skip the scarce check entirely when it already tells us for
+        # certain that no dataset exists.
+        if main_catalog_has_stats is False:
+            st.error(
+                f"{selected_accession} does not have a full summary statistics dataset at all -- "
+                "the main GWAS Catalog record itself confirms this (full_summary_stats_available=False). "
+                "This isn't something the manual FTP route can work around either; only top/curated "
+                "associations exist for this study, not a full genome-wide dataset. "
+                "(Skipped the Summary Statistics API check to save your limited quota for that endpoint.)"
+            )
+            st.markdown(f"[Open {selected_accession} on the GWAS Catalog website]({catalog_study_url})")
+            summary_stats_ok = False
+        else:
+            try:
+                summary_stats_ok = _cached_check_summary_stats(selected_accession)
+            except gwas_catalog_client.GwasCatalogRateLimitError as e:
+                st.error(
+                    "Hit the Summary Statistics API's rate limit (as low as 10 requests/hour on this "
+                    "endpoint). Please wait before checking more studies. "
+                    + (f"Retry-After: {e.retry_after}" if e.retry_after else "")
+                )
+                summary_stats_ok = False
+            except gwas_catalog_client.GwasCatalogAPIError as e:
+                st.warning(
+                    f"The Summary Statistics API returned an error checking {selected_accession} "
+                    f"(most likely a temporary problem on EBI's end, not something wrong with your "
+                    f"setup): {e}. Falling back to the FTP route below."
+                )
+                summary_stats_ok = False
+
+            if not summary_stats_ok:
+                if main_catalog_has_stats is True:
+                    st.warning(
+                        f"{selected_accession} has full summary statistics according to the main catalog, but is "
+                        "not (yet) loaded into the separate Summary Statistics API used by this page. The file does "
+                        "exist -- use the manual FTP download route from P1 for this study instead."
+                    )
+                else:
+                    st.warning(
+                        f"{selected_accession} does not appear to be loaded into the Summary Statistics API, and "
+                        "this study's summary-stats flag from the main catalog wasn't available either. Try the "
+                        "manual FTP download route from P1, or check the study page directly."
+                    )
+                st.markdown(f"[Open {selected_accession} on the GWAS Catalog website]({catalog_study_url})")
+
+        if summary_stats_ok:
+            st.success(f"{selected_accession} is available in the Summary Statistics API.")
+
+            if st.button("Preview significant variants"):
+                try:
+                    sig_df = _cached_fetch_significant(selected_accession, effective_p_upper)
+                    st.session_state["gwas_search_sig_df"] = sig_df
+                    st.session_state["gwas_search_sig_accession"] = selected_accession
+                    st.session_state["gwas_search_sig_source"] = "rest_api"
+                except gwas_catalog_client.GwasCatalogRateLimitError as e:
+                    st.error(
+                        "Hit the Summary Statistics API's rate limit while pulling variants (as low as "
+                        "10 requests/hour on this endpoint, and a study with many significant variants "
+                        "needs one request per page). Please wait before trying again. "
+                        + (f"Retry-After: {e.retry_after}" if e.retry_after else "")
+                    )
+                except gwas_catalog_client.GwasCatalogAPIError as e:
+                    st.warning(
+                        f"The Summary Statistics API returned an error while pulling variants for "
+                        f"{selected_accession} (most likely temporary on EBI's end): {e}. Try the FTP "
+                        "route below instead, or try again in a moment."
+                    )
+        else:
+            st.markdown("---")
+            st.write(
+                "**Try automated FTP download instead** -- reads directly from EBI's FTP archive "
+                "(not the rate-limited REST API), the same files P1 downloaded by hand, now automated."
+            )
+
+            try:
+                import gwas_catalog_ftp
+            except ImportError:
+                gwas_catalog_ftp = None
+                st.error(
+                    "gwas_catalog_ftp.py was not found next to app.py. "
+                    "Please add it to the MRDRP-main/ folder and rerun."
+                )
+
+            LARGE_FILE_WARN_BYTES = 300 * 1024 * 1024  # 300 MB
+
+            if gwas_catalog_ftp is not None and st.button("Check FTP file for this study"):
+                with st.spinner(f"Looking up {selected_accession} on the FTP archive..."):
+                    try:
+                        best_file = gwas_catalog_ftp.find_best_available_file(selected_accession)
+                    except gwas_catalog_ftp.GwasFtpError as e:
+                        best_file = None
+                        st.error(f"Could not check the FTP archive: {e}")
+                st.session_state["gwas_search_ftp_best_file"] = best_file
+                st.session_state["gwas_search_ftp_best_file_accession"] = selected_accession
+
+            best_file = st.session_state.get("gwas_search_ftp_best_file")
+            best_file_matches = st.session_state.get("gwas_search_ftp_best_file_accession") == selected_accession
+
+            if gwas_catalog_ftp is not None and best_file_matches:
+                if best_file is None:
+                    st.error(
+                        f"No usable file found for {selected_accession} on the FTP archive either "
+                        f"(checked both the harmonised/ subfolder and the top-level directory)."
+                    )
+                else:
+                    size_note = f", size: {best_file['size_str']}" if best_file.get("size_str") else ""
+                    st.write(f"Found: `{best_file['filename']}` (build: {best_file['build']}, source: {best_file['source']}{size_note})")
+                    if best_file["build"] not in ("GRCh38",):
+                        st.caption(
+                            "Build isn't confirmed GRCh38 for this file -- liftover to GRCh38 will be "
+                            "attempted automatically on the significant variants after filtering."
+                        )
+
+                    size_bytes = gwas_catalog_ftp.parse_size_str_to_bytes(best_file.get("size_str"))
+                    ready_to_download = True
+                    if size_bytes and size_bytes > LARGE_FILE_WARN_BYTES:
+                        st.warning(
+                            f"This file is {best_file['size_str']} -- downloading and filtering a file this size "
+                            "has taken up to 30+ minutes. Confirm before starting."
+                        )
+                        ready_to_download = st.checkbox(
+                            f"Yes, download this {best_file['size_str']} file anyway",
+                            value=False,
+                            key=f"confirm_large_ftp_{selected_accession}",
+                        )
+
+                    if ready_to_download and st.button("Start FTP download"):
+                        progress_bar = st.progress(0.0)
+                        progress_text = st.empty()
+
+                        def _update_download_progress(downloaded, total):
+                            downloaded_mb = downloaded / (1024 * 1024)
+                            if total:
+                                fraction = min(downloaded / total, 1.0)
+                                total_mb = total / (1024 * 1024)
+                                progress_bar.progress(fraction)
+                                progress_text.text(f"Downloading... {downloaded_mb:.1f} / {total_mb:.1f} MB ({fraction * 100:.0f}%)")
+                            else:
+                                # Server didn't send a Content-Length -- show bytes moved
+                                # so far rather than a bar with no known endpoint.
+                                progress_text.text(f"Downloading... {downloaded_mb:.1f} MB (total size unknown)")
+
+                        try:
+                            sig_df = gwas_catalog_ftp.fetch_significant_from_ftp(
+                                selected_accession, p_upper=effective_p_upper,
+                                work_dir=LOCAL_SCRATCH_DIR / "_gwas_ftp_downloads",
+                                progress_callback=_update_download_progress,
+                            )
+                            progress_bar.progress(1.0)
+                            progress_text.text("Download complete -- filtering for significant variants...")
+                            st.session_state["gwas_search_sig_df"] = sig_df
+                            st.session_state["gwas_search_sig_accession"] = selected_accession
+                            st.session_state["gwas_search_sig_source"] = "ftp"
+                            if "liftover_attempted" in sig_df.columns and sig_df["liftover_attempted"].any():
+                                n_lifted = int((sig_df["liftover_attempted"] & sig_df["harmonised"]).sum())
+                                n_tried = int(sig_df["liftover_attempted"].sum())
+                                st.info(f"Liftover to GRCh38 ran on {n_tried} row(s): {n_lifted} succeeded.")
+                        except gwas_catalog_ftp.GwasFtpError as e:
+                            st.error(f"FTP download/filter failed: {e}")
+
+        sig_source = st.session_state.get("gwas_search_sig_source", "rest_api")
+        sig_df = st.session_state.get("gwas_search_sig_df", pd.DataFrame())
+
+        if len(sig_df) > 0 and st.session_state.get("gwas_search_sig_accession") == selected_accession:
+            source_label = "FTP archive" if sig_source == "ftp" else "Summary Statistics API"
+            if target_role == "outcome":
+                st.write(f"**{len(sig_df)} variant(s)** found (full outcome dataset, no p-value filtering; source: {source_label}).")
+            else:
+                st.write(f"**{len(sig_df)} significant variant(s)** found at p < {effective_p_upper:.1e} (source: {source_label}).")
+
+            if "harmonised" in sig_df.columns:
+                n_harmonised = int(sig_df["harmonised"].sum())
+                pct = round(100 * n_harmonised / len(sig_df), 1) if len(sig_df) else 0.0
+                if n_harmonised == len(sig_df):
+                    st.success(f"All {len(sig_df)} variants are build **GRCh38**.")
+                elif n_harmonised > 0:
+                    st.warning(
+                        f"{n_harmonised} / {len(sig_df)} variants ({pct}%) are build **GRCh38**. "
+                        f"The remaining {len(sig_df) - n_harmonised} have unknown build."
+                    )
+                else:
+                    st.error(
+                        "None of these variants have a confirmed GRCh38 build. "
+                        "Build is unknown for all rows."
+                    )
+
+            _found_map, _full_stats_candidate, _screen_status, _screen_notes = inspect_columns(sig_df.columns.tolist())
+            if _screen_status == "Suitable candidate":
+                st.success(f"Field check: **{_screen_status}** -- {_screen_notes}")
+            elif _screen_status == "Needs adaptation":
+                st.warning(f"Field check: **{_screen_status}** -- {_screen_notes}")
+            else:
+                st.error(f"Field check: **{_screen_status}** -- {_screen_notes}")
+
+            st.dataframe(sig_df.head(200), use_container_width=True)
+
+            if show_raw:
+                with st.expander("Raw response / file note", expanded=False):
+                    st.write(f"Columns returned are native to the {source_label}.")
+                    st.code(str(sig_df.columns.tolist()))
+
+            only_harmonised = True
+            if "harmonised" in sig_df.columns and sig_df["harmonised"].any():
+                only_harmonised = st.checkbox(
+                    "Only save GRCh38 variants (recommended -- matches the build-consistency approach used in P1)",
+                    value=True,
+                )
+
+            if "harmonised" in sig_df.columns and only_harmonised:
+                save_df = sig_df[sig_df["harmonised"]].reset_index(drop=True)
+                build_suffix = "_buildGRCh38"
+            else:
+                save_df = sig_df
+                build_suffix = ""
+
+            if len(save_df) == 0:
+                st.warning("No rows left to save with the current filter.")
+            else:
+                source_tag = "GWASCatalogFTP" if sig_source == "ftp" else "GWASCatalogAPI"
+                dest_dir = (EXPOSURES_DIR if target_role == "exposure" else OUTCOME_DIR) / target_trait_folder
+                dest_file = dest_dir / f"{selected_accession}_{source_tag}{build_suffix}.csv.gz"
+
+                st.write(f"Will save **{len(save_df)}** row(s) to: `{dest_file}` (gzip-compressed)")
+
+                save_col, download_col = st.columns(2)
+
+                with save_col:
+                    if st.button(f"Save into {target_role}/{target_trait_folder}/ folder"):
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        save_df.to_csv(dest_file, index=False, compression="gzip")
+                        st.success(
+                            f"Saved {len(save_df)} rows to {dest_file.name} (gzip-compressed -- "
+                            "reading code elsewhere in the pipeline already handles this transparently). "
+                            "Go to 'Targeted File Screening' and run batch scan to pick it up."
+                        )
+
+                with download_col:
+                    st.download_button(
+                        label="Download as CSV instead",
+                        data=save_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"{selected_accession}_{source_tag}{build_suffix}.csv",
+                        mime="text/csv",
+                        key=make_unique_download_key("gwas_search_download", target_role, selected_accession)
+                    )
+        elif "gwas_search_sig_accession" in st.session_state and st.session_state["gwas_search_sig_accession"] == selected_accession:
+            st.warning(f"No variants reached p < {effective_p_upper:.1e} for this study. Try a looser threshold.")
+
+
+# =========================================================
 # Page 2: Targeted File Screening
 # =========================================================
 elif page == "Targeted File Screening":
@@ -1002,7 +1911,11 @@ elif page == "Targeted File Screening":
 
     st.markdown("---")
 
-    with st.expander("Expected folder structure", expanded=True):
+    with st.expander("Sample folder structure", expanded=True):
+        st.caption(
+            "This is the original case-study layout, kept as an example -- trait folders under exposures/ "
+            "and outcome/ can be anything; the GWAS Catalog Search page creates new ones automatically."
+        )
         st.code(
             """
 MRDRP-main/
@@ -1022,10 +1935,16 @@ MRDRP-main/
         st.warning("No supported files found. Please add .tsv.gz, .tsv, .csv.gz, or .csv files into the exposure/outcome folders.")
         st.stop()
 
-    file_options = [
-        f'{item["role"]} | {item["trait"]} | {item["file_name"]}'
-        for item in all_target_files
-    ]
+    file_options = []
+    for item in all_target_files:
+        item_path = Path(item["file_path"])
+        try:
+            size_str, row_count = _cached_file_size_and_rows(str(item_path), item_path.stat().st_mtime)
+            row_note = f"{row_count:,} rows" if row_count is not None else "rows unknown"
+            info_note = f"{size_str}, {row_note}"
+        except Exception:
+            info_note = "size/rows unavailable"
+        file_options.append(f'{item["role"]} | {item["trait"]} | {item["file_name"]} | {info_note}')
 
     selected_label = st.selectbox("Choose a file to inspect", file_options)
     selected_idx = file_options.index(selected_label)
@@ -1035,6 +1954,22 @@ MRDRP-main/
 
     st.subheader("1) Selected file")
     st.code(selected_record["file_path"])
+
+    _selected_file_path = Path(selected_record["file_path"])
+    if _selected_file_path.exists():
+        try:
+            _file_bytes = _cached_read_file_bytes(str(_selected_file_path), _selected_file_path.stat().st_mtime)
+            st.download_button(
+                f"Download full file ({format_file_size(len(_file_bytes))})",
+                data=_file_bytes,
+                file_name=_selected_file_path.name,
+                mime="application/octet-stream",
+                key="targeted_file_download_button",
+            )
+        except Exception as e:
+            st.caption(f"Could not prepare file for download: {e}")
+    else:
+        st.caption("File no longer exists at this path.")
 
     try:
         df_preview, auto_record = scan_single_file(selected_record, preview_rows=preview_rows)
@@ -1217,7 +2152,74 @@ MRDRP-main/
 
     st.subheader("8) Existing targeted screening record")
     if TARGET_RECORD_FILE.exists():
-        st.dataframe(load_target_record(), use_container_width=True)
+        current_target_df = load_target_record()
+        st.dataframe(current_target_df, use_container_width=True)
+
+        st.markdown("**Manage records**")
+        st.caption(
+            "Deleting here also permanently deletes the underlying file(s) from Drive, not just the "
+            "record row -- otherwise a later batch scan would just find the file again and re-add it."
+        )
+        manage_col1, manage_col2 = st.columns(2)
+
+        with manage_col1:
+            if len(current_target_df) > 0 and "file_path" in current_target_df.columns:
+                target_delete_labels = {
+                    str(row["file_path"]): f'{row.get("file_name", row["file_path"])} ({row.get("trait", "")}, {row.get("role", "")})'
+                    for _, row in current_target_df.iterrows()
+                }
+                target_paths_to_delete = st.multiselect(
+                    "Select record(s) to delete",
+                    options=list(target_delete_labels.keys()),
+                    format_func=lambda fp: target_delete_labels.get(fp, fp),
+                    key="target_record_delete_select",
+                )
+                confirm_delete_target_selected = st.checkbox(
+                    "Yes, also permanently delete the underlying file(s) for the selected record(s)",
+                    value=False,
+                    key="confirm_delete_target_selected",
+                )
+                if (
+                    st.button("Delete selected record(s)", key="target_record_delete_button")
+                    and target_paths_to_delete
+                    and confirm_delete_target_selected
+                ):
+                    deleted_files = 0
+                    for fp in target_paths_to_delete:
+                        try:
+                            file_to_delete = Path(fp)
+                            if file_to_delete.exists():
+                                file_to_delete.unlink()
+                                deleted_files += 1
+                        except OSError as e:
+                            st.warning(f"Could not delete file {fp}: {e}")
+                    remaining_target_df = current_target_df[
+                        ~current_target_df["file_path"].astype(str).isin(target_paths_to_delete)
+                    ]
+                    remaining_target_df.to_csv(TARGET_RECORD_FILE, index=False)
+                    st.success(f"Deleted {len(target_paths_to_delete)} record(s) and {deleted_files} underlying file(s).")
+                    st.rerun()
+
+        with manage_col2:
+            confirm_clear_target = st.checkbox(
+                "Yes, clear ALL targeted screening records AND permanently delete their underlying files",
+                value=False,
+                key="confirm_clear_target_record",
+            )
+            if st.button("Clear all records", key="target_record_clear_button") and confirm_clear_target:
+                deleted_files = 0
+                if "file_path" in current_target_df.columns:
+                    for fp in current_target_df["file_path"].dropna().astype(str):
+                        try:
+                            file_to_delete = Path(fp)
+                            if file_to_delete.exists():
+                                file_to_delete.unlink()
+                                deleted_files += 1
+                        except OSError as e:
+                            st.warning(f"Could not delete file {fp}: {e}")
+                TARGET_RECORD_FILE.unlink(missing_ok=True)
+                st.success(f"All targeted screening records cleared, {deleted_files} underlying file(s) deleted.")
+                st.rerun()
     else:
         st.info("No targeted screening record exists yet.")
 
@@ -1227,7 +2229,11 @@ MRDRP-main/
 # =========================================================
 elif page == "Analysis Set Selection":
     st.title("🔗 Analysis Set Selection")
-    st.caption("Select multiple exposure files and one endometrial cancer outcome file.")
+    st.caption(
+        "Select exposure file(s) and one outcome file to create an analysis set. Any exposure traits are "
+        "allowed, in any combination -- including multiple files for the same trait (e.g. two different "
+        "IGF1 studies), which can be useful for comparing results across data sources."
+    )
 
     if not TARGET_RECORD_FILE.exists():
         st.warning("No targeted screening record found. Please scan and save targeted files first.")
@@ -1253,6 +2259,78 @@ elif page == "Analysis Set Selection":
     with c3:
         st.metric("Saved analysis sets", analysis_set_count)
 
+    st.subheader("0) Existing analysis sets")
+    st.caption("Shown up-front so you can browse/manage saved sets without first picking an exposure below.")
+
+    if ANALYSIS_SET_RECORD_FILE.exists():
+        current_sets_df = pd.read_csv(ANALYSIS_SET_RECORD_FILE)
+        st.dataframe(current_sets_df, use_container_width=True)
+
+        st.markdown("**Manage analysis sets**")
+        st.caption(
+            "Deleting here also permanently deletes that set's computed results folder under "
+            "backend_work/mr_outputs_by_set/, not just the record row -- otherwise stale results "
+            "could resurface later (e.g. if a new set reuses the same name)."
+        )
+        manage_set_col1, manage_set_col2 = st.columns(2)
+
+        with manage_set_col1:
+            if len(current_sets_df) > 0 and "analysis_set_name" in current_sets_df.columns:
+                sets_to_delete = st.multiselect(
+                    "Select analysis set(s) to delete",
+                    options=current_sets_df["analysis_set_name"].astype(str).tolist(),
+                    key="analysis_set_delete_select",
+                )
+                confirm_delete_sets_selected = st.checkbox(
+                    "Yes, also permanently delete the results folder(s) for the selected set(s)",
+                    value=False,
+                    key="confirm_delete_sets_selected",
+                )
+                if (
+                    st.button("Delete selected analysis set(s)", key="analysis_set_delete_button")
+                    and sets_to_delete
+                    and confirm_delete_sets_selected
+                ):
+                    deleted_folders = 0
+                    for set_name in sets_to_delete:
+                        set_output_dir = BACKEND_ROOT / "mr_outputs_by_set" / re.sub(r"[^A-Za-z0-9_.-]+", "_", set_name)
+                        if set_output_dir.exists():
+                            try:
+                                shutil.rmtree(set_output_dir)
+                                deleted_folders += 1
+                            except OSError as e:
+                                st.warning(f"Could not delete results folder for '{set_name}': {e}")
+                    remaining_sets_df = current_sets_df[
+                        ~current_sets_df["analysis_set_name"].astype(str).isin(sets_to_delete)
+                    ]
+                    remaining_sets_df.to_csv(ANALYSIS_SET_RECORD_FILE, index=False)
+                    st.success(f"Deleted {len(sets_to_delete)} analysis set(s) and {deleted_folders} results folder(s).")
+                    st.rerun()
+
+        with manage_set_col2:
+            confirm_clear_sets = st.checkbox(
+                "Yes, clear ALL analysis set records AND permanently delete their results folders",
+                value=False,
+                key="confirm_clear_analysis_sets",
+            )
+            if st.button("Clear all analysis set records", key="analysis_set_clear_button") and confirm_clear_sets:
+                deleted_folders = 0
+                if "analysis_set_name" in current_sets_df.columns:
+                    for set_name in current_sets_df["analysis_set_name"].dropna().astype(str):
+                        set_output_dir = BACKEND_ROOT / "mr_outputs_by_set" / re.sub(r"[^A-Za-z0-9_.-]+", "_", set_name)
+                        if set_output_dir.exists():
+                            try:
+                                shutil.rmtree(set_output_dir)
+                                deleted_folders += 1
+                            except OSError as e:
+                                st.warning(f"Could not delete results folder for '{set_name}': {e}")
+                ANALYSIS_SET_RECORD_FILE.unlink(missing_ok=True)
+                st.success(f"All analysis set records cleared, {deleted_folders} results folder(s) deleted.")
+                st.rerun()
+    else:
+        st.info("No analysis set record exists yet.")
+
+
     if len(exposure_df) == 0:
         st.warning("No exposure records found. Please label exposure files first.")
         st.stop()
@@ -1263,7 +2341,41 @@ elif page == "Analysis Set Selection":
 
     st.subheader("1) Select analysis set")
 
-    default_set_name = "Artesunate_EndometrialCancer_GRCh38_Set01"
+    # ---- P2: edit-an-existing-set support ---------------------------------
+    # Lets you load an existing analysis set's current composition back into
+    # the selection UI below, instead of reconstructing it from memory.
+    # Saving still goes through the same "Save / Update" button in section 4
+    # -- overwrite-by-name already worked at the storage layer, this just
+    # makes editing reachable from the UI too.
+    existing_set_names = []
+    if ANALYSIS_SET_RECORD_FILE.exists():
+        _existing_sets_for_edit = pd.read_csv(ANALYSIS_SET_RECORD_FILE)
+        if "analysis_set_name" in _existing_sets_for_edit.columns:
+            existing_set_names = _existing_sets_for_edit["analysis_set_name"].astype(str).tolist()
+
+    set_mode = st.radio(
+        "Mode",
+        options=["Create new analysis set", "Edit an existing analysis set"],
+        horizontal=True,
+        key="analysis_set_mode",
+    )
+
+    edit_row = None
+    if set_mode == "Edit an existing analysis set":
+        if len(existing_set_names) == 0:
+            st.info("No existing analysis sets to edit yet. Switch to 'Create new analysis set' to make the first one.")
+        else:
+            edit_target_name = st.selectbox(
+                "Analysis set to edit",
+                options=existing_set_names,
+                key="analysis_set_edit_target",
+            )
+            edit_row = _existing_sets_for_edit[
+                _existing_sets_for_edit["analysis_set_name"].astype(str) == edit_target_name
+            ].iloc[0]
+            st.caption("The selections below are pre-filled from this saved set. Add/remove freely, then save under the same name to update it.")
+
+    default_set_name = str(edit_row["analysis_set_name"]) if edit_row is not None else "New_Analysis_Set_01"
 
     analysis_set_name = st.text_input(
         "Analysis set name",
@@ -1276,43 +2388,70 @@ elif page == "Analysis Set Selection":
     exposure_file_to_label = dict(zip(exposure_df["file_name"], exposure_df["option_label"]))
     exposure_options = exposure_df["option_label"].tolist()
 
-    # Default selection:
-    # Prefer the four manually selected GRCh38 exposure files.
-    preferred_defaults = [
-        exposure_file_to_label[f]
-        for f in PREFERRED_EXPOSURE_FILES
-        if f in exposure_file_to_label
-    ]
-
-    # If preferred files are not all available, choose one available file per required trait.
-    if len(preferred_defaults) < 4:
-        fallback_defaults = []
-        chosen_traits = set()
-
-        for _, row in exposure_df.iterrows():
-            canonical = canonical_trait_name(row.get("trait", ""))
-
-            if canonical in REQUIRED_EXPOSURE_TRAITS and canonical not in chosen_traits:
-                fallback_defaults.append(row["option_label"])
-                chosen_traits.add(canonical)
-
-        default_exposure_labels = fallback_defaults
+    if edit_row is not None:
+        # Load this set's current exposure files back into the multiselect.
+        # Files that no longer exist in the screening record (deleted/renamed
+        # since the set was saved) are silently skipped, with a warning below.
+        edit_exposure_files = [
+            f.strip() for f in str(edit_row.get("exposure_files", "")).split(";") if f.strip()
+        ]
+        default_exposure_labels = [
+            exposure_file_to_label[f] for f in edit_exposure_files if f in exposure_file_to_label
+        ]
+        _missing_exposure_files = [f for f in edit_exposure_files if f not in exposure_file_to_label]
+        if _missing_exposure_files:
+            st.warning(
+                "This saved set references exposure file(s) no longer in the screening record, "
+                "so they could not be pre-selected: " + "; ".join(_missing_exposure_files)
+            )
     else:
-        default_exposure_labels = preferred_defaults
+        # Default selection: pre-fill the original case-study files if they
+        # happen to still be present, purely as a convenience. P2 does not
+        # require any specific trait or number of exposures, so there is no
+        # fallback that forces a particular selection when they aren't found --
+        # the multiselect just starts empty in that case.
+        default_exposure_labels = [
+            exposure_file_to_label[f]
+            for f in PREFERRED_EXPOSURE_FILES
+            if f in exposure_file_to_label
+        ]
 
     selected_exposure_labels = st.multiselect(
-        "Select exposure files",
+        "Select exposure file(s) -- any trait, any combination; multiple files of the same trait are fine",
         options=exposure_options,
         default=default_exposure_labels
     )
 
     outcome_df["option_label"] = outcome_df.apply(make_file_label, axis=1)
     outcome_label_to_file = dict(zip(outcome_df["option_label"], outcome_df["file_name"]))
+    outcome_file_to_label = dict(zip(outcome_df["file_name"], outcome_df["option_label"]))
     outcome_options = outcome_df["option_label"].tolist()
 
-    selected_outcome_label = st.selectbox(
-        "Select outcome file",
-        options=outcome_options
+    if edit_row is not None:
+        # New-format sets store outcome_files (plural); older sets saved
+        # before multi-outcome support only have outcome_file (singular) --
+        # check both so editing works for sets saved either way.
+        _edit_outcome_files_raw = str(edit_row.get("outcome_files", "")).strip()
+        if not _edit_outcome_files_raw or _edit_outcome_files_raw == "nan":
+            _edit_outcome_files_raw = str(edit_row.get("outcome_file", "")).strip()
+        edit_outcome_files = [f.strip() for f in _edit_outcome_files_raw.split(";") if f.strip() and f.strip() != "nan"]
+        default_outcome_labels = [
+            outcome_file_to_label[f] for f in edit_outcome_files if f in outcome_file_to_label
+        ]
+        _missing_outcome_files = [f for f in edit_outcome_files if f not in outcome_file_to_label]
+        if _missing_outcome_files:
+            st.warning(
+                "This saved set references outcome file(s) no longer in the screening record, "
+                "so they could not be pre-selected: " + "; ".join(_missing_outcome_files)
+            )
+    else:
+        default_outcome_labels = []
+
+    selected_outcome_labels = st.multiselect(
+        "Select outcome file(s) -- multiple outcomes are run independently against each exposure; "
+        "useful as a hedge if one outcome study turns out to be too narrow/underpowered to match your instruments",
+        options=outcome_options,
+        default=default_outcome_labels
     )
 
     selected_exposure_files = [
@@ -1320,14 +2459,21 @@ elif page == "Analysis Set Selection":
         for label in selected_exposure_labels
     ]
 
-    selected_outcome_file = outcome_label_to_file[selected_outcome_label]
+    selected_outcome_files = [
+        outcome_label_to_file[label]
+        for label in selected_outcome_labels
+    ]
 
     if len(selected_exposure_files) == 0:
         st.warning("Please select at least one exposure file.")
         st.stop()
 
+    if len(selected_outcome_files) == 0:
+        st.warning("Please select at least one outcome file.")
+        st.stop()
+
     selected_exposures = exposure_df[exposure_df["file_name"].isin(selected_exposure_files)].copy()
-    selected_outcome = outcome_df[outcome_df["file_name"] == selected_outcome_file].iloc[0]
+    selected_outcomes = outcome_df[outcome_df["file_name"].isin(selected_outcome_files)].copy()
 
     st.subheader("2) Selected files summary")
 
@@ -1341,35 +2487,71 @@ elif page == "Analysis Set Selection":
         "notes"
     ]].copy()
 
-    outcome_summary = pd.DataFrame([{
-        "file_name": selected_outcome.get("file_name", ""),
-        "trait": selected_outcome.get("trait", ""),
-        "build": selected_outcome.get("build", ""),
-        "status": selected_outcome.get("status", ""),
-        "effect_size_type": selected_outcome.get("effect_size_type", ""),
-        "variant_identifier": selected_outcome.get("variant_identifier", ""),
-        "notes": selected_outcome.get("notes", "")
-    }])
+    outcome_summary = selected_outcomes[[
+        "file_name",
+        "trait",
+        "build",
+        "status",
+        "effect_size_type",
+        "variant_identifier",
+        "notes"
+    ]].copy()
 
     st.markdown("**Selected exposures**")
     st.dataframe(exposure_summary, use_container_width=True)
 
-    st.markdown("**Selected outcome**")
+    # Breakdown by canonical trait -- makes it visible when a trait has more
+    # than one file selected (e.g. two different IGF1 studies). This is
+    # allowed and can be useful for comparing MR results across data sources.
+    selected_exposures["canonical_trait"] = selected_exposures["trait"].astype(str).apply(canonical_trait_name)
+    trait_counts_df = (
+        selected_exposures["canonical_trait"]
+        .value_counts()
+        .reset_index()
+    )
+    trait_counts_df.columns = ["trait", "file_count"]
+    exposure_trait_counts_str = "; ".join(f"{r['trait']}: {r['file_count']}" for _, r in trait_counts_df.iterrows())
+
+    st.markdown("**Files per exposure trait**")
+    st.dataframe(trait_counts_df, use_container_width=True)
+    if (trait_counts_df["file_count"] > 1).any():
+        st.caption(
+            "One or more traits have multiple files selected -- this is supported, and can be useful for "
+            "comparing MR results across different studies of the same exposure."
+        )
+
+    st.markdown("**Selected outcome(s)**")
     st.dataframe(outcome_summary, use_container_width=True)
 
-    selected_canonical_traits = set(
-        canonical_trait_name(t)
-        for t in selected_exposures["trait"].astype(str).tolist()
-    )
+    # Same breakdown for outcomes -- each exposure gets run against EVERY
+    # selected outcome independently, so if one outcome dataset turns out to
+    # be too narrow (e.g. a single-gene burden-test file rather than a
+    # genome-wide study) to cover your instruments, the others aren't
+    # affected.
+    if len(selected_outcomes) > 1:
+        selected_outcomes["canonical_trait"] = selected_outcomes["trait"].astype(str).apply(canonical_trait_name)
+        outcome_trait_counts_df = (
+            selected_outcomes["canonical_trait"]
+            .value_counts()
+            .reset_index()
+        )
+        outcome_trait_counts_df.columns = ["trait", "file_count"]
+        st.markdown("**Files per outcome trait**")
+        st.dataframe(outcome_trait_counts_df, use_container_width=True)
+        st.caption(
+            "Multiple outcomes selected -- each exposure will be analysed against every outcome "
+            "independently. This multiplies the number of MR runs (exposures x outcomes), so expect "
+            "the backend notebook run to take proportionally longer."
+        )
 
-    missing_exposure_traits = [
-        trait for trait in REQUIRED_EXPOSURE_TRAITS
-        if trait not in selected_canonical_traits
-    ]
+    outcome_traits_str = "; ".join(selected_outcomes["trait"].astype(str).tolist())
 
     st.subheader("3) Analysis set readiness check")
 
-    all_builds = selected_exposures["build"].astype(str).tolist() + [str(selected_outcome.get("build", "Unknown"))]
+    all_builds = (
+        selected_exposures["build"].astype(str).tolist()
+        + selected_outcomes["build"].astype(str).tolist()
+    )
     unique_builds = sorted(list(set(all_builds)))
 
     if len(unique_builds) == 1 and unique_builds[0] != "Unknown":
@@ -1382,19 +2564,15 @@ elif page == "Analysis Set Selection":
         build_route = "; ".join(unique_builds)
         build_match = "No"
 
-    statuses = selected_exposures["status"].astype(str).tolist() + [str(selected_outcome.get("status", ""))]
+    statuses = (
+        selected_exposures["status"].astype(str).tolist()
+        + selected_outcomes["status"].astype(str).tolist()
+    )
 
     has_not_suitable = any(s == "Not suitable for current pipeline" for s in statuses)
     has_adaptation = any(s == "Needs adaptation" for s in statuses)
-    has_missing_required_exposures = len(missing_exposure_traits) > 0
 
-    if has_missing_required_exposures:
-        set_status = "Needs review"
-        set_notes_default = (
-            "The analysis set does not include all required exposure categories. "
-            f"Missing exposure traits: {', '.join(missing_exposure_traits)}."
-        )
-    elif has_not_suitable:
+    if has_not_suitable:
         set_status = "Needs review"
         set_notes_default = "One or more selected files are not suitable for the current pipeline."
     elif build_match == "No":
@@ -1405,24 +2583,23 @@ elif page == "Analysis Set Selection":
     elif build_match == "Uncertain":
         set_status = "Needs review"
         set_notes_default = "Genome build is unknown for one or more files. Build should be confirmed before MR analysis."
-    elif build_match == "Yes" and has_adaptation:
+    elif has_adaptation:
         set_status = "Ready after adaptation"
         set_notes_default = (
-            "All required exposure traits are selected and all files share the same genome build, "
-            "but one or more files require adaptation before backend MR analysis. "
-            "For example, odds_ratio may need conversion to beta, or variant identifiers may require mapping."
+            "All selected files share the same genome build, but one or more files require adaptation "
+            "before backend MR analysis. For example, odds_ratio may need conversion to beta, or variant "
+            "identifiers may require mapping."
         )
     else:
         set_status = "Ready"
-        set_notes_default = "All required exposure traits are selected, all files are suitable candidates, and all files share the same genome build."
+        set_notes_default = "All selected files are suitable candidates and share the same genome build."
 
     readiness_df = pd.DataFrame([{
         "analysis_set_name": analysis_set_name,
         "number_of_exposures": len(selected_exposures),
-        "required_exposures": "; ".join(REQUIRED_EXPOSURE_TRAITS),
-        "selected_exposure_traits": "; ".join(sorted(selected_canonical_traits)),
-        "missing_exposure_traits": "; ".join(missing_exposure_traits) if missing_exposure_traits else "None",
-        "outcome_file": selected_outcome_file,
+        "exposure_trait_counts": exposure_trait_counts_str,
+        "number_of_outcomes": len(selected_outcomes),
+        "outcome_files": "; ".join(selected_outcome_files),
         "build_route": build_route,
         "build_match": build_match,
         "has_adaptation": "Yes" if has_adaptation else "No",
@@ -1453,10 +2630,9 @@ elif page == "Analysis Set Selection":
         "analysis_set_name": analysis_set_name,
         "exposure_files": "; ".join(selected_exposures["file_name"].astype(str).tolist()),
         "exposure_traits": "; ".join(selected_exposures["trait"].astype(str).tolist()),
-        "required_exposures": "; ".join(REQUIRED_EXPOSURE_TRAITS),
-        "missing_exposure_traits": "; ".join(missing_exposure_traits) if missing_exposure_traits else "None",
-        "outcome_file": selected_outcome_file,
-        "outcome_trait": str(selected_outcome.get("trait", "")),
+        "exposure_trait_counts": exposure_trait_counts_str,
+        "outcome_files": "; ".join(selected_outcome_files),
+        "outcome_traits": outcome_traits_str,
         "build_route": build_route,
         "build_match": build_match,
         "set_status": set_status,
@@ -1483,12 +2659,6 @@ elif page == "Analysis Set Selection":
         st.success("Analysis set record saved.")
         st.dataframe(updated_sets, use_container_width=True)
 
-    st.subheader("5) Existing analysis set records")
-
-    if ANALYSIS_SET_RECORD_FILE.exists():
-        st.dataframe(pd.read_csv(ANALYSIS_SET_RECORD_FILE), use_container_width=True)
-    else:
-        st.info("No analysis set record exists yet.")
 
 
 # =========================================================
@@ -1498,614 +2668,839 @@ elif page == "Backend MR Results":
     st.title("📊 Backend MR Results")
     st.caption("Display backend MR outputs generated from the GRCh38 Artesunate/endometrial cancer workflow.")
 
-    backend_file_map = {
-        "Backend status report": BACKEND_STATUS_REPORT_FILE,
-        "Multi-outcome comparison report": MULTI_OUTCOME_REPORT_FILE,
-        "Significant variant QC": SIGNIFICANT_VARIANT_QC_FILE,
-        "Single-outcome SNP overlap": SNP_OVERLAP_FILE,
-        "Single-outcome MR run summary": COORDINATE_MR_RUN_SUMMARY_FILE,
-        "Single-outcome combined MR results": COORDINATE_COMBINED_MR_RESULTS_FILE,
-        "Multi-outcome preparation summary": MULTI_OUTCOME_PREPARE_SUMMARY_FILE,
-        "Multi-outcome SNP overlap": MULTI_OUTCOME_SNP_OVERLAP_FILE,
-        "Multi-outcome MR run summary": MULTI_OUTCOME_MR_RUN_SUMMARY_FILE,
-        "Multi-outcome combined MR results": MULTI_OUTCOME_COMBINED_MR_RESULTS_FILE,
-    }
-
-    status_df = file_status_table(backend_file_map)
-
-    existing_outputs = int(status_df["exists"].sum()) if len(status_df) > 0 else 0
-    total_outputs = len(status_df)
-
-    multi_prepare_df = read_csv_if_exists(MULTI_OUTCOME_PREPARE_SUMMARY_FILE)
-    multi_overlap_df = read_csv_if_exists(MULTI_OUTCOME_SNP_OVERLAP_FILE)
-    multi_run_df = read_csv_if_exists(MULTI_OUTCOME_MR_RUN_SUMMARY_FILE)
-    multi_results_df = read_csv_if_exists(MULTI_OUTCOME_COMBINED_MR_RESULTS_FILE)
-    sig_qc_df = read_csv_if_exists(SIGNIFICANT_VARIANT_QC_FILE)
-
-    summary = summarise_multi_outcome_results(
-        combined_df=multi_results_df,
-        run_df=multi_run_df,
-        overlap_df=multi_overlap_df
+    st.markdown("---")
+    st.subheader("0) Run MR for a saved analysis set (P2)")
+    st.caption(
+        "Works with any analysis set saved on the 'Analysis Set Selection' page -- not just the "
+        "original 4-exposure case study below. The actual R / TwoSampleMR computation runs in your "
+        "MR pipeline notebook in Colab, not inside this dashboard; this section just reads whatever "
+        "results that notebook has already written for the set you pick."
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        st.metric("Backend files found", f"{existing_outputs}/{total_outputs}")
-    with c2:
-        st.metric("Successful MR runs", summary["successful_runs"])
-    with c3:
-        st.metric("MR result rows", summary["mr_result_rows"])
-    with c4:
-        st.metric("Nominal significant rows", summary["nominal_significant_rows"])
-
-    st.markdown("---")
-
-    if existing_outputs == 0:
-        st.warning(
-            "No backend MR output files were detected yet. Please run the backend MR Colab cells first, then refresh this dashboard."
-        )
-        st.dataframe(status_df, use_container_width=True)
-        st.stop()
-
-    st.subheader("1) Backend output file status")
-    st.dataframe(status_df, use_container_width=True)
-
-    with st.expander("Backend output folder", expanded=False):
-        st.code(str(MR_SUMMARY_DIR), language="text")
-
-    st.subheader("2) Quick interpretation")
-    quick_interpretation = generate_quick_interpretation(
-        combined_df=multi_results_df,
-        run_df=multi_run_df,
-        overlap_df=multi_overlap_df
-    )
-    st.info(quick_interpretation)
-
-    st.markdown(format_backend_note())
-
-    st.markdown("---")
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Overview",
-        "Outcome comparison",
-        "MR results",
-        "Reports",
-        "Downloads"
-    ])
-
-    with tab1:
-        st.subheader("Significant variant selection")
-
-        if len(sig_qc_df) > 0:
-            st.dataframe(sig_qc_df, use_container_width=True)
-            show_download_button(sig_qc_df, "significant_variant_qc.csv", "Download significant variant QC")
+    if not ANALYSIS_SET_RECORD_FILE.exists():
+        st.info("No analysis sets saved yet. Create one on the 'Analysis Set Selection' page first.")
+    else:
+        saved_sets_df = pd.read_csv(ANALYSIS_SET_RECORD_FILE)
+        if len(saved_sets_df) == 0 or "analysis_set_name" not in saved_sets_df.columns:
+            st.info("No analysis sets saved yet. Create one on the 'Analysis Set Selection' page first.")
         else:
-            st.warning("Significant variant QC file is not available.")
+            set_names = saved_sets_df["analysis_set_name"].astype(str).tolist()
+            selected_set_name = st.selectbox("Analysis set", set_names, key="p2_mr_set_select")
 
-        st.subheader("Multi-outcome MR run summary")
+            _p2_record_matches = saved_sets_df[saved_sets_df["analysis_set_name"].astype(str) == selected_set_name]
+            if len(_p2_record_matches) > 0:
+                st.markdown("**This set's record**")
+                _p2_record_row = _p2_record_matches.iloc[-1]
+                st.dataframe(_p2_record_row.to_frame(name="Value"), use_container_width=True)
 
-        if len(multi_run_df) > 0:
-            st.dataframe(multi_run_df, use_container_width=True)
+            p2_set_output_dir = BACKEND_ROOT / "mr_outputs_by_set" / re.sub(r"[^A-Za-z0-9_.-]+", "_", selected_set_name)
+            p2_combined_path = p2_set_output_dir / "combined_mr_results.csv"
+            p2_clump_path = p2_set_output_dir / "clumping_summary.csv"
+            p2_run_path = p2_set_output_dir / "mr_run_summary.csv"
+            p2_progress_path = p2_set_output_dir / "_run_progress.json"
 
-            if "status" in multi_run_df.columns:
-                run_counts = (
-                    multi_run_df["status"]
-                    .astype(str)
-                    .value_counts()
-                    .reset_index()
-                )
-                run_counts.columns = ["status", "count"]
-                st.markdown("**Run status counts**")
-                st.dataframe(run_counts, use_container_width=True)
+            def _p2_read_progress():
+                if not p2_progress_path.exists():
+                    return None
+                try:
+                    with open(p2_progress_path, encoding="utf-8") as f:
+                        return json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    return None
 
-            show_download_button(multi_run_df, "multi_outcome_mr_run_summary.csv", "Download MR run summary")
-        else:
-            st.warning("Multi-outcome MR run summary is not available.")
+            def _p2_pid_alive(pid) -> bool:
+                if not pid:
+                    return False
+                try:
+                    os.kill(int(pid), 0)
+                    return True
+                except (OSError, ValueError, TypeError):
+                    return False
 
-    with tab2:
-        st.subheader("Outcome preparation summary")
-
-        if len(multi_prepare_df) > 0:
-            st.dataframe(multi_prepare_df, use_container_width=True)
-
-            if "status" in multi_prepare_df.columns:
-                prepared_count = int((multi_prepare_df["status"].astype(str).str.lower() == "prepared").sum())
-                failed_count = int((multi_prepare_df["status"].astype(str).str.lower() == "failed").sum())
-                st.write(f"Prepared outcome files: **{prepared_count}**")
-                st.write(f"Failed outcome files: **{failed_count}**")
-
-            show_download_button(multi_prepare_df, "multi_outcome_prepare_summary.csv", "Download outcome preparation summary")
-        else:
-            st.warning("Multi-outcome preparation summary is not available.")
-
-        st.subheader("SNP overlap summary")
-
-        if len(multi_overlap_df) > 0:
-            st.dataframe(multi_overlap_df, use_container_width=True)
-
-            if {"set_name", "trait", "overlap_snps"}.issubset(set(multi_overlap_df.columns)):
-                overlap_view = multi_overlap_df[["set_name", "trait", "exposure_snps", "outcome_snps", "overlap_snps"]].copy()
-                st.markdown("**Overlap comparison view**")
-                st.dataframe(overlap_view, use_container_width=True)
-
-            show_download_button(multi_overlap_df, "multi_outcome_snp_overlap.csv", "Download SNP overlap summary")
-        else:
-            st.warning("Multi-outcome SNP overlap summary is not available.")
-
-    with tab3:
-        st.subheader("Combined MR results")
-
-        if len(multi_results_df) > 0:
-            filter_cols = st.columns(3)
-
-            filtered_df = multi_results_df.copy()
-
-            with filter_cols[0]:
-                if "trait" in filtered_df.columns:
-                    trait_options = ["All"] + sorted(filtered_df["trait"].dropna().astype(str).unique().tolist())
-                    selected_trait = st.selectbox("Filter by trait", trait_options)
-                    if selected_trait != "All":
-                        filtered_df = filtered_df[filtered_df["trait"].astype(str) == selected_trait]
-
-            with filter_cols[1]:
-                if "method" in filtered_df.columns:
-                    method_options = ["All"] + sorted(filtered_df["method"].dropna().astype(str).unique().tolist())
-                    selected_method = st.selectbox("Filter by MR method", method_options)
-                    if selected_method != "All":
-                        filtered_df = filtered_df[filtered_df["method"].astype(str) == selected_method]
-
-            with filter_cols[2]:
-                show_primary_cols_only = st.checkbox("Show simplified columns", value=True)
-
-            if "pval" in filtered_df.columns:
-                filtered_df["pval"] = pd.to_numeric(filtered_df["pval"], errors="coerce")
-                filtered_df = filtered_df.sort_values("pval", ascending=True)
-
-            if show_primary_cols_only:
-                primary_cols = [
-                    "set_name",
-                    "trait",
-                    "method",
-                    "nsnp",
-                    "b",
-                    "se",
-                    "pval",
-                    "MR_OR",
-                    "MR_OR_lower_95CI",
-                    "MR_OR_upper_95CI",
-                    "nominal_significant",
-                    "overlap_snps"
-                ]
-                display_cols = [c for c in primary_cols if c in filtered_df.columns]
-                st.dataframe(filtered_df[display_cols], use_container_width=True)
-            else:
-                st.dataframe(filtered_df, use_container_width=True)
-
-            show_download_button(filtered_df, "filtered_multi_outcome_mr_results.csv", "Download filtered MR results")
-
-            st.markdown("**Interpretation guide**")
-            st.write(
-                "MR_OR < 1 suggests a protective-direction estimate, while MR_OR > 1 suggests a risk-increasing direction. "
-                "However, the current results are prototype outputs and should not be interpreted as final formal causal evidence."
+            _p2_progress = _p2_read_progress()
+            _p2_run_in_progress = (
+                _p2_progress is not None
+                and _p2_progress.get("status") == "running"
+                and _p2_pid_alive(_p2_progress.get("pid"))
             )
-        else:
-            st.warning("Multi-outcome combined MR results are not available.")
 
-    with tab4:
-        st.subheader("Backend status report")
+            st.markdown("**Run this set directly from the dashboard**")
+            st.caption(
+                "Launches as a real background process on this server -- it keeps running even if "
+                "you close this browser tab or the tunnel drops, as long as the server itself stays "
+                "up. Come back and reopen this page any time to see live progress or the finished "
+                "results."
+            )
 
-        backend_report_text = read_text_if_exists(BACKEND_STATUS_REPORT_FILE)
-        if backend_report_text:
-            st.markdown(backend_report_text)
-        else:
-            st.info("Single-outcome backend status report is not available.")
+            if _p2_run_in_progress:
 
-        st.subheader("Multi-outcome comparison report")
+                @st.fragment(run_every=2)
+                def _p2_show_live_progress():
+                    progress = _p2_read_progress()
+                    if progress is None or not _p2_pid_alive(progress.get("pid")):
+                        st.warning(
+                            "The background process for this run seems to have stopped unexpectedly "
+                            "(e.g. the server restarted) without finishing. You can start a new run below."
+                        )
+                        return
+                    status = progress.get("status")
+                    if status == "running":
+                        fraction = progress.get("fraction") or 0.0
+                        st.progress(fraction)
+                        elapsed_min = (time.time() - progress.get("started_at", time.time())) / 60
+                        st.caption(f"{fraction * 100:.0f}% -- {progress.get('message', '')}  (running {elapsed_min:.1f} min)")
+                    elif status == "completed":
+                        st.success(progress.get("message", "Completed."))
+                        st.rerun()
+                    elif status == "failed":
+                        st.error(f"Analysis failed: {progress.get('message')}")
+                        with st.expander("Full error details"):
+                            st.code(progress.get("error", ""), language=None)
 
-        multi_report_text = read_text_if_exists(MULTI_OUTCOME_REPORT_FILE)
-        if multi_report_text:
-            with st.expander("Show full multi-outcome comparison report", expanded=False):
-                report_view_mode = st.radio(
-                    "Report display mode",
-                    ["Readable text", "Rendered markdown"],
-                    horizontal=True,
-                    key="multi_outcome_report_view_mode"
+                _p2_show_live_progress()
+
+            else:
+                if _p2_progress is not None and _p2_progress.get("status") == "failed":
+                    st.error(f"Last run failed: {_p2_progress.get('message')}")
+                    with st.expander("Full error details from the last run"):
+                        st.code(_p2_progress.get("error", ""), language=None)
+
+                p2_jwt_input = st.text_input(
+                    "OpenGWAS JWT token (needed for LD clumping; pasted once per browser session, "
+                    "not stored on disk)",
+                    type="password", key="p2_opengwas_jwt_input",
                 )
-
-                if report_view_mode == "Readable text":
-                    st.text_area(
-                        "Full report markdown text",
-                        value=multi_report_text,
-                        height=650
+                with st.expander("What is this token, and how do I get one?"):
+                    st.markdown(
+                        "TwoSampleMR's LD clumping step calls the OpenGWAS API on your behalf, which "
+                        "requires a personal access token to authenticate the request -- without it, "
+                        "clumping (and therefore the whole run) will fail partway through.\n\n"
+                        "To get one: sign in at [api.opengwas.io](https://api.opengwas.io/) and generate "
+                        "a JWT from your account page, then paste it above. It's only kept in memory for "
+                        "this browser session and passed directly to the analysis process -- it's never "
+                        "written to disk here."
                     )
-                else:
-                    st.markdown(multi_report_text)
 
-                st.download_button(
-                    label="Download multi-outcome comparison report",
-                    data=multi_report_text.encode("utf-8"),
-                    file_name="multi_outcome_backend_mr_comparison_report.md",
-                    mime="text/markdown"
-                )
-        else:
-            st.info("Multi-outcome comparison report is not available.")
+                run_label = "Re-run this analysis set" if p2_combined_path.exists() else "Run MR analysis for this set"
+                if st.button(run_label, key="p2_run_analysis_button"):
+                    if not p2_jwt_input.strip():
+                        st.error("Paste your OpenGWAS JWT token above first.")
+                    elif not MR_ANALYSIS_LAUNCHER_SCRIPT.exists():
+                        st.error(f"Launcher script not found: {MR_ANALYSIS_LAUNCHER_SCRIPT}. Make sure run_mr_analysis_for_set.py is in the project folder.")
+                    else:
+                        launch_env = {**os.environ, "OPENGWAS_JWT": p2_jwt_input.strip()}
+                        subprocess.Popen(
+                            [sys.executable, str(MR_ANALYSIS_LAUNCHER_SCRIPT), selected_set_name],
+                            env=launch_env,
+                            cwd=str(PROJECT_ROOT),
+                            start_new_session=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        st.success(f"Started analysis for '{selected_set_name}' in the background.")
+                        time.sleep(1)
+                        st.rerun()
 
-    with tab5:
-        st.subheader("Available backend result files")
+            st.markdown("---")
 
+            if not p2_combined_path.exists():
+                if not _p2_run_in_progress:
+                    st.info(
+                        f"No MR results yet for '{selected_set_name}'. Use the button above, or if you "
+                        "prefer running it manually: open `Python_based_MR_drug_repurposing_pipeline.ipynb`, "
+                        "and after your existing R / rpy2 / TwoSampleMR / OpenGWAS-JWT setup cells, run:"
+                    )
+                    st.code(
+                        "import sys\n"
+                        "sys.path.insert(0, \"/content/drive/MyDrive/UM_WQF7023/MRDRP-main\")\n"
+                        "import mr_pipeline\n\n"
+                        f"mr_pipeline.run_pipeline_for_analysis_set({selected_set_name!r})",
+                        language="python",
+                    )
+                    st.caption("Then come back and refresh this page.")
+            else:
+                def _p2_safe_read_csv(path):
+                    if not path.exists():
+                        return pd.DataFrame()
+                    try:
+                        return pd.read_csv(path)
+                    except pd.errors.EmptyDataError:
+                        return pd.DataFrame()
+
+                p2_combined_df = _p2_safe_read_csv(p2_combined_path)
+                p2_clump_df = _p2_safe_read_csv(p2_clump_path)
+                p2_run_df = _p2_safe_read_csv(p2_run_path)
+
+                pc1, pc2, pc3, pc4 = st.columns(4)
+                with pc1:
+                    st.metric("Exposure files run", len(p2_run_df))
+                with pc2:
+                    n_success = int((p2_run_df["status"] == "success").sum()) if "status" in p2_run_df.columns else 0
+                    st.metric("Successful MR runs", n_success)
+                with pc3:
+                    st.metric("MR result rows", len(p2_combined_df))
+                with pc4:
+                    n_sig = 0
+                    if "pval" in p2_combined_df.columns:
+                        n_sig = int((pd.to_numeric(p2_combined_df["pval"], errors="coerce") < 0.05).sum())
+                    st.metric("Nominal significant rows (p<0.05)", n_sig)
+
+                p2_tab1, p2_tab2, p2_tab3 = st.tabs(["MR results", "Clumping summary", "Run summary"])
+
+                with p2_tab1:
+                    if len(p2_combined_df) > 0:
+                        p2_display_df = p2_combined_df.copy()
+                        if "pval" in p2_display_df.columns:
+                            p2_display_df["pval"] = pd.to_numeric(p2_display_df["pval"], errors="coerce")
+                            p2_display_df = p2_display_df.sort_values("pval", ascending=True)
+                        st.dataframe(p2_display_df, use_container_width=True)
+                        st.download_button(
+                            "Download combined MR results",
+                            data=p2_display_df.to_csv(index=False).encode("utf-8"),
+                            file_name=f"{selected_set_name}_combined_mr_results.csv",
+                            mime="text/csv",
+                            key=make_unique_download_key("p2_mr_download", "combined", selected_set_name),
+                        )
+                    else:
+                        st.warning(
+                            "No successful MR result rows for this set -- every exposure file may have "
+                            "failed or been skipped. Check the 'Run summary' tab for details."
+                        )
+                        _p2_reason_text = " ".join(
+                            p2_clump_df.get("reason", pd.Series(dtype=str)).astype(str).tolist()
+                            + p2_run_df.get("error", pd.Series(dtype=str)).astype(str).tolist()
+                        )
+                        if "OPENGWAS_JWT" in _p2_reason_text:
+                            st.info(
+                                "Looks like the OpenGWAS token wasn't set when this ran. In the pipeline "
+                                "notebook, run your OpenGWAS token cell first (same as before), *then* call "
+                                "mr_pipeline.run_pipeline_for_analysis_set(...) again in that same session."
+                            )
+
+                with p2_tab2:
+                    if len(p2_clump_df) > 0:
+                        st.dataframe(p2_clump_df, use_container_width=True)
+                    else:
+                        st.info("No clumping summary file found for this set.")
+
+                with p2_tab3:
+                    if len(p2_run_df) > 0:
+                        st.dataframe(p2_run_df, use_container_width=True)
+                    else:
+                        st.info("No run summary file found for this set.")
+
+    st.markdown("---")
+    with st.expander("Original P1 case-study backend results (fixed 4-exposure set) -- legacy, kept for reference", expanded=False):
+
+        backend_file_map = {
+            "Backend status report": BACKEND_STATUS_REPORT_FILE,
+            "Multi-outcome comparison report": MULTI_OUTCOME_REPORT_FILE,
+            "Significant variant QC": SIGNIFICANT_VARIANT_QC_FILE,
+            "Single-outcome SNP overlap": SNP_OVERLAP_FILE,
+            "Single-outcome MR run summary": COORDINATE_MR_RUN_SUMMARY_FILE,
+            "Single-outcome combined MR results": COORDINATE_COMBINED_MR_RESULTS_FILE,
+            "Multi-outcome preparation summary": MULTI_OUTCOME_PREPARE_SUMMARY_FILE,
+            "Multi-outcome SNP overlap": MULTI_OUTCOME_SNP_OVERLAP_FILE,
+            "Multi-outcome MR run summary": MULTI_OUTCOME_MR_RUN_SUMMARY_FILE,
+            "Multi-outcome combined MR results": MULTI_OUTCOME_COMBINED_MR_RESULTS_FILE,
+        }
+
+        status_df = file_status_table(backend_file_map)
+
+        existing_outputs = int(status_df["exists"].sum()) if len(status_df) > 0 else 0
+        total_outputs = len(status_df)
+
+        multi_prepare_df = read_csv_if_exists(MULTI_OUTCOME_PREPARE_SUMMARY_FILE)
+        multi_overlap_df = read_csv_if_exists(MULTI_OUTCOME_SNP_OVERLAP_FILE)
+        multi_run_df = read_csv_if_exists(MULTI_OUTCOME_MR_RUN_SUMMARY_FILE)
+        multi_results_df = read_csv_if_exists(MULTI_OUTCOME_COMBINED_MR_RESULTS_FILE)
+        sig_qc_df = read_csv_if_exists(SIGNIFICANT_VARIANT_QC_FILE)
+
+        summary = summarise_multi_outcome_results(
+            combined_df=multi_results_df,
+            run_df=multi_run_df,
+            overlap_df=multi_overlap_df
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        with c1:
+            st.metric("Backend files found", f"{existing_outputs}/{total_outputs}")
+        with c2:
+            st.metric("Successful MR runs", summary["successful_runs"])
+        with c3:
+            st.metric("MR result rows", summary["mr_result_rows"])
+        with c4:
+            st.metric("Nominal significant rows", summary["nominal_significant_rows"])
+
+        st.markdown("---")
+
+        if existing_outputs == 0:
+            st.warning(
+                "No backend MR output files were detected yet. Please run the backend MR Colab cells first, then refresh this dashboard."
+            )
+            st.dataframe(status_df, use_container_width=True)
+            st.stop()
+
+        st.subheader("1) Backend output file status")
         st.dataframe(status_df, use_container_width=True)
 
-        st.write("Use the buttons below to download key result tables.")
+        with st.expander("Backend output folder", expanded=False):
+            st.code(str(MR_SUMMARY_DIR), language="text")
 
-        if len(multi_results_df) > 0:
-            show_download_button(multi_results_df, "multi_outcome_combined_mr_results.csv", "Download combined MR results")
+        st.subheader("2) Quick interpretation")
+        quick_interpretation = generate_quick_interpretation(
+            combined_df=multi_results_df,
+            run_df=multi_run_df,
+            overlap_df=multi_overlap_df
+        )
+        st.info(quick_interpretation)
 
-        if len(multi_overlap_df) > 0:
-            show_download_button(multi_overlap_df, "multi_outcome_snp_overlap.csv", "Download multi-outcome SNP overlap")
+        st.markdown(format_backend_note())
 
-        if len(multi_run_df) > 0:
-            show_download_button(multi_run_df, "multi_outcome_mr_run_summary.csv", "Download multi-outcome MR run summary")
+        st.markdown("---")
 
-        if len(multi_prepare_df) > 0:
-            show_download_button(multi_prepare_df, "multi_outcome_prepare_summary.csv", "Download multi-outcome preparation summary")
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "Overview",
+            "Outcome comparison",
+            "MR results",
+            "Reports",
+            "Downloads"
+        ])
+
+        with tab1:
+            st.subheader("Significant variant selection")
+
+            if len(sig_qc_df) > 0:
+                st.dataframe(sig_qc_df, use_container_width=True)
+                show_download_button(sig_qc_df, "significant_variant_qc.csv", "Download significant variant QC")
+            else:
+                st.warning("Significant variant QC file is not available.")
+
+            st.subheader("Multi-outcome MR run summary")
+
+            if len(multi_run_df) > 0:
+                st.dataframe(multi_run_df, use_container_width=True)
+
+                if "status" in multi_run_df.columns:
+                    run_counts = (
+                        multi_run_df["status"]
+                        .astype(str)
+                        .value_counts()
+                        .reset_index()
+                    )
+                    run_counts.columns = ["status", "count"]
+                    st.markdown("**Run status counts**")
+                    st.dataframe(run_counts, use_container_width=True)
+
+                show_download_button(multi_run_df, "multi_outcome_mr_run_summary.csv", "Download MR run summary")
+            else:
+                st.warning("Multi-outcome MR run summary is not available.")
+
+        with tab2:
+            st.subheader("Outcome preparation summary")
+
+            if len(multi_prepare_df) > 0:
+                st.dataframe(multi_prepare_df, use_container_width=True)
+
+                if "status" in multi_prepare_df.columns:
+                    prepared_count = int((multi_prepare_df["status"].astype(str).str.lower() == "prepared").sum())
+                    failed_count = int((multi_prepare_df["status"].astype(str).str.lower() == "failed").sum())
+                    st.write(f"Prepared outcome files: **{prepared_count}**")
+                    st.write(f"Failed outcome files: **{failed_count}**")
+
+                show_download_button(multi_prepare_df, "multi_outcome_prepare_summary.csv", "Download outcome preparation summary")
+            else:
+                st.warning("Multi-outcome preparation summary is not available.")
+
+            st.subheader("SNP overlap summary")
+
+            if len(multi_overlap_df) > 0:
+                st.dataframe(multi_overlap_df, use_container_width=True)
+
+                if {"set_name", "trait", "overlap_snps"}.issubset(set(multi_overlap_df.columns)):
+                    overlap_view = multi_overlap_df[["set_name", "trait", "exposure_snps", "outcome_snps", "overlap_snps"]].copy()
+                    st.markdown("**Overlap comparison view**")
+                    st.dataframe(overlap_view, use_container_width=True)
+
+                show_download_button(multi_overlap_df, "multi_outcome_snp_overlap.csv", "Download SNP overlap summary")
+            else:
+                st.warning("Multi-outcome SNP overlap summary is not available.")
+
+        with tab3:
+            st.subheader("Combined MR results")
+
+            if len(multi_results_df) > 0:
+                filter_cols = st.columns(3)
+
+                filtered_df = multi_results_df.copy()
+
+                with filter_cols[0]:
+                    if "trait" in filtered_df.columns:
+                        trait_options = ["All"] + sorted(filtered_df["trait"].dropna().astype(str).unique().tolist())
+                        selected_trait = st.selectbox("Filter by trait", trait_options)
+                        if selected_trait != "All":
+                            filtered_df = filtered_df[filtered_df["trait"].astype(str) == selected_trait]
+
+                with filter_cols[1]:
+                    if "method" in filtered_df.columns:
+                        method_options = ["All"] + sorted(filtered_df["method"].dropna().astype(str).unique().tolist())
+                        selected_method = st.selectbox("Filter by MR method", method_options)
+                        if selected_method != "All":
+                            filtered_df = filtered_df[filtered_df["method"].astype(str) == selected_method]
+
+                with filter_cols[2]:
+                    show_primary_cols_only = st.checkbox("Show simplified columns", value=True)
+
+                if "pval" in filtered_df.columns:
+                    filtered_df["pval"] = pd.to_numeric(filtered_df["pval"], errors="coerce")
+                    filtered_df = filtered_df.sort_values("pval", ascending=True)
+
+                if show_primary_cols_only:
+                    primary_cols = [
+                        "set_name",
+                        "trait",
+                        "method",
+                        "nsnp",
+                        "b",
+                        "se",
+                        "pval",
+                        "MR_OR",
+                        "MR_OR_lower_95CI",
+                        "MR_OR_upper_95CI",
+                        "nominal_significant",
+                        "overlap_snps"
+                    ]
+                    display_cols = [c for c in primary_cols if c in filtered_df.columns]
+                    st.dataframe(filtered_df[display_cols], use_container_width=True)
+                else:
+                    st.dataframe(filtered_df, use_container_width=True)
+
+                show_download_button(filtered_df, "filtered_multi_outcome_mr_results.csv", "Download filtered MR results")
+
+                st.markdown("**Interpretation guide**")
+                st.write(
+                    "MR_OR < 1 suggests a protective-direction estimate, while MR_OR > 1 suggests a risk-increasing direction. "
+                    "However, the current results are prototype outputs and should not be interpreted as final formal causal evidence."
+                )
+            else:
+                st.warning("Multi-outcome combined MR results are not available.")
+
+        with tab4:
+            st.subheader("Backend status report")
+
+            backend_report_text = read_text_if_exists(BACKEND_STATUS_REPORT_FILE)
+            if backend_report_text:
+                st.markdown(backend_report_text)
+            else:
+                st.info("Single-outcome backend status report is not available.")
+
+            st.subheader("Multi-outcome comparison report")
+
+            multi_report_text = read_text_if_exists(MULTI_OUTCOME_REPORT_FILE)
+            if multi_report_text:
+                with st.expander("Show full multi-outcome comparison report", expanded=False):
+                    report_view_mode = st.radio(
+                        "Report display mode",
+                        ["Readable text", "Rendered markdown"],
+                        horizontal=True,
+                        key="multi_outcome_report_view_mode"
+                    )
+
+                    if report_view_mode == "Readable text":
+                        st.text_area(
+                            "Full report markdown text",
+                            value=multi_report_text,
+                            height=650
+                        )
+                    else:
+                        st.markdown(multi_report_text)
+
+                    st.download_button(
+                        label="Download multi-outcome comparison report",
+                        data=multi_report_text.encode("utf-8"),
+                        file_name="multi_outcome_backend_mr_comparison_report.md",
+                        mime="text/markdown"
+                    )
+            else:
+                st.info("Multi-outcome comparison report is not available.")
+
+        with tab5:
+            st.subheader("Available backend result files")
+
+            st.dataframe(status_df, use_container_width=True)
+
+            st.write("Use the buttons below to download key result tables.")
+
+            if len(multi_results_df) > 0:
+                show_download_button(multi_results_df, "multi_outcome_combined_mr_results.csv", "Download combined MR results")
+
+            if len(multi_overlap_df) > 0:
+                show_download_button(multi_overlap_df, "multi_outcome_snp_overlap.csv", "Download multi-outcome SNP overlap")
+
+            if len(multi_run_df) > 0:
+                show_download_button(multi_run_df, "multi_outcome_mr_run_summary.csv", "Download multi-outcome MR run summary")
+
+            if len(multi_prepare_df) > 0:
+                show_download_button(multi_prepare_df, "multi_outcome_prepare_summary.csv", "Download multi-outcome preparation summary")
 
 
 
 # =========================================================
 # Page 5: MR Pipeline + LD Clumping
 # =========================================================
-if page == "MR Pipeline + LD Clumping":
+if page == "MR Pipeline + LD Clumping (P1 legacy)":
     st.title("🧬 MR Pipeline + LD Clumping")
-    st.caption("Integrated MR pipeline view with rsID mapping, LD clumping, and clumped MR rerun outputs.")
+    st.caption("P1 legacy page, kept for reference -- current work uses the 'Backend MR Results' page above instead.")
 
-    def _read_csv(path: Path):
-        if path.exists():
-            try:
-                return pd.read_csv(path)
-            except Exception as e:
-                st.warning(f"Failed to read {path.name}: {e}")
-                return pd.DataFrame()
-        return pd.DataFrame()
+    with st.expander("Show P1 pipeline details (legacy, kept for reference)", expanded=False):
+        def _read_csv(path: Path):
+            if path.exists():
+                try:
+                    return pd.read_csv(path)
+                except Exception as e:
+                    st.warning(f"Failed to read {path.name}: {e}")
+                    return pd.DataFrame()
+            return pd.DataFrame()
 
-    def _read_text(path: Path):
-        if path.exists():
-            try:
-                return path.read_text(encoding="utf-8")
-            except Exception as e:
-                return f"Failed to read {path.name}: {e}"
-        return ""
-
-
-
-    def _download_df(df: pd.DataFrame, file_name: str, label: str):
-        if df is not None and len(df) > 0:
-            st.download_button(
-                label=label,
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name=file_name,
-                mime="text/csv",
-                key=make_unique_download_key("ld_download_df", label, file_name)
-            )
+        def _read_text(path: Path):
+            if path.exists():
+                try:
+                    return path.read_text(encoding="utf-8")
+                except Exception as e:
+                    return f"Failed to read {path.name}: {e}"
+            return ""
 
 
-    def _download_text(text: str, file_name: str, label: str):
-        if text is not None and len(text.strip()) > 0:
-            st.download_button(
-                label=label,
-                data=text.encode("utf-8"),
-                file_name=file_name,
-                mime="text/markdown",
-                key=make_unique_download_key("ld_download_text", label, file_name)
-            )
 
-    ld_file_map = {
-        "rsID mapping summary": RSID_MAPPING_SUMMARY_FILE,
-        "LD clumping input summary": LD_CLUMPING_INPUT_SUMMARY_FILE,
-        "LD clumping summary": LD_CLUMPING_SUMMARY_FILE,
-        "MR-ready clumped exposure summary": MR_READY_CLUMPED_EXPOSURE_SUMMARY_FILE,
-        "Clumped multi-outcome SNP overlap": CLUMPED_MULTI_OUTCOME_SNP_OVERLAP_FILE,
-        "Clumped multi-outcome MR run summary": CLUMPED_MULTI_OUTCOME_MR_RUN_SUMMARY_FILE,
-        "Clumped multi-outcome combined MR results": CLUMPED_MULTI_OUTCOME_COMBINED_MR_RESULTS_FILE,
-        "LD clumping improvement report": LD_CLUMPING_IMPROVEMENT_REPORT_FILE,
-    }
+        def _download_df(df: pd.DataFrame, file_name: str, label: str):
+            if df is not None and len(df) > 0:
+                st.download_button(
+                    label=label,
+                    data=df.to_csv(index=False).encode("utf-8"),
+                    file_name=file_name,
+                    mime="text/csv",
+                    key=make_unique_download_key("ld_download_df", label, file_name)
+                )
 
-    ld_status_records = []
-    for output_name, path in ld_file_map.items():
-        path = Path(path)
-        ld_status_records.append({
-            "output_name": output_name,
-            "file_name": path.name,
-            "exists": path.exists(),
-            "size_MB": round(path.stat().st_size / 1024 / 1024, 3) if path.exists() else 0,
-            "path": str(path)
-        })
-    ld_status_df = pd.DataFrame(ld_status_records)
 
-    rsid_df = _read_csv(RSID_MAPPING_SUMMARY_FILE)
-    ld_input_df = _read_csv(LD_CLUMPING_INPUT_SUMMARY_FILE)
-    ld_summary_df = _read_csv(LD_CLUMPING_SUMMARY_FILE)
-    mr_ready_clumped_df = _read_csv(MR_READY_CLUMPED_EXPOSURE_SUMMARY_FILE)
-    clumped_overlap_df = _read_csv(CLUMPED_MULTI_OUTCOME_SNP_OVERLAP_FILE)
-    clumped_run_df = _read_csv(CLUMPED_MULTI_OUTCOME_MR_RUN_SUMMARY_FILE)
-    clumped_results_df = _read_csv(CLUMPED_MULTI_OUTCOME_COMBINED_MR_RESULTS_FILE)
-    ld_report_text = _read_text(LD_CLUMPING_IMPROVEMENT_REPORT_FILE)
+        def _download_text(text: str, file_name: str, label: str):
+            if text is not None and len(text.strip()) > 0:
+                st.download_button(
+                    label=label,
+                    data=text.encode("utf-8"),
+                    file_name=file_name,
+                    mime="text/markdown",
+                    key=make_unique_download_key("ld_download_text", label, file_name)
+                )
 
-    # --------------------------------------------------------
-    # Top metrics
-    # --------------------------------------------------------
+        ld_file_map = {
+            "rsID mapping summary": RSID_MAPPING_SUMMARY_FILE,
+            "LD clumping input summary": LD_CLUMPING_INPUT_SUMMARY_FILE,
+            "LD clumping summary": LD_CLUMPING_SUMMARY_FILE,
+            "MR-ready clumped exposure summary": MR_READY_CLUMPED_EXPOSURE_SUMMARY_FILE,
+            "Clumped multi-outcome SNP overlap": CLUMPED_MULTI_OUTCOME_SNP_OVERLAP_FILE,
+            "Clumped multi-outcome MR run summary": CLUMPED_MULTI_OUTCOME_MR_RUN_SUMMARY_FILE,
+            "Clumped multi-outcome combined MR results": CLUMPED_MULTI_OUTCOME_COMBINED_MR_RESULTS_FILE,
+            "LD clumping improvement report": LD_CLUMPING_IMPROVEMENT_REPORT_FILE,
+        }
 
-    existing_ld_outputs = int(ld_status_df["exists"].sum()) if len(ld_status_df) > 0 else 0
-    total_ld_outputs = len(ld_status_df)
+        ld_status_records = []
+        for output_name, path in ld_file_map.items():
+            path = Path(path)
+            ld_status_records.append({
+                "output_name": output_name,
+                "file_name": path.name,
+                "exists": path.exists(),
+                "size_MB": round(path.stat().st_size / 1024 / 1024, 3) if path.exists() else 0,
+                "path": str(path)
+            })
+        ld_status_df = pd.DataFrame(ld_status_records)
 
-    mapped_variants = 0
-    total_variants = 0
-    if len(rsid_df) > 0:
-        if "mapped_rsid_count" in rsid_df.columns:
-            mapped_variants = int(pd.to_numeric(rsid_df["mapped_rsid_count"], errors="coerce").fillna(0).sum())
-        if "total_variants" in rsid_df.columns:
-            total_variants = int(pd.to_numeric(rsid_df["total_variants"], errors="coerce").fillna(0).sum())
+        rsid_df = _read_csv(RSID_MAPPING_SUMMARY_FILE)
+        ld_input_df = _read_csv(LD_CLUMPING_INPUT_SUMMARY_FILE)
+        ld_summary_df = _read_csv(LD_CLUMPING_SUMMARY_FILE)
+        mr_ready_clumped_df = _read_csv(MR_READY_CLUMPED_EXPOSURE_SUMMARY_FILE)
+        clumped_overlap_df = _read_csv(CLUMPED_MULTI_OUTCOME_SNP_OVERLAP_FILE)
+        clumped_run_df = _read_csv(CLUMPED_MULTI_OUTCOME_MR_RUN_SUMMARY_FILE)
+        clumped_results_df = _read_csv(CLUMPED_MULTI_OUTCOME_COMBINED_MR_RESULTS_FILE)
+        ld_report_text = _read_text(LD_CLUMPING_IMPROVEMENT_REPORT_FILE)
 
-    clumped_variants = 0
-    input_variants = 0
-    if len(ld_summary_df) > 0:
-        if "input_variants" in ld_summary_df.columns:
-            input_variants = int(pd.to_numeric(ld_summary_df["input_variants"], errors="coerce").fillna(0).sum())
-        if "clumped_variants" in ld_summary_df.columns:
-            clumped_variants = int(pd.to_numeric(ld_summary_df["clumped_variants"], errors="coerce").fillna(0).sum())
+        # --------------------------------------------------------
+        # Top metrics
+        # --------------------------------------------------------
 
-    successful_clumped_runs = 0
-    if len(clumped_run_df) > 0 and "status" in clumped_run_df.columns:
-        successful_clumped_runs = int((clumped_run_df["status"].astype(str).str.lower() == "success").sum())
+        existing_ld_outputs = int(ld_status_df["exists"].sum()) if len(ld_status_df) > 0 else 0
+        total_ld_outputs = len(ld_status_df)
 
-    nominal_sig_rows = 0
-    if len(clumped_results_df) > 0 and "nominal_significant" in clumped_results_df.columns:
-        nominal_sig_rows = int(clumped_results_df["nominal_significant"].fillna(False).sum())
+        mapped_variants = 0
+        total_variants = 0
+        if len(rsid_df) > 0:
+            if "mapped_rsid_count" in rsid_df.columns:
+                mapped_variants = int(pd.to_numeric(rsid_df["mapped_rsid_count"], errors="coerce").fillna(0).sum())
+            if "total_variants" in rsid_df.columns:
+                total_variants = int(pd.to_numeric(rsid_df["total_variants"], errors="coerce").fillna(0).sum())
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("LD output files found", f"{existing_ld_outputs}/{total_ld_outputs}")
-    with c2:
-        st.metric("Mapped rsID variants", f"{mapped_variants}/{total_variants}")
-    with c3:
-        st.metric("LD-clumped variants", f"{clumped_variants}/{input_variants}")
-    with c4:
-        st.metric("Clumped MR significant rows", nominal_sig_rows)
+        clumped_variants = 0
+        input_variants = 0
+        if len(ld_summary_df) > 0:
+            if "input_variants" in ld_summary_df.columns:
+                input_variants = int(pd.to_numeric(ld_summary_df["input_variants"], errors="coerce").fillna(0).sum())
+            if "clumped_variants" in ld_summary_df.columns:
+                clumped_variants = int(pd.to_numeric(ld_summary_df["clumped_variants"], errors="coerce").fillna(0).sum())
 
-    st.markdown("---")
+        successful_clumped_runs = 0
+        if len(clumped_run_df) > 0 and "status" in clumped_run_df.columns:
+            successful_clumped_runs = int((clumped_run_df["status"].astype(str).str.lower() == "success").sum())
 
-    # --------------------------------------------------------
-    # Quick interpretation
-    # --------------------------------------------------------
+        nominal_sig_rows = 0
+        if len(clumped_results_df) > 0 and "nominal_significant" in clumped_results_df.columns:
+            nominal_sig_rows = int(clumped_results_df["nominal_significant"].fillna(False).sum())
 
-    st.subheader("1) Quick interpretation")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("LD output files found", f"{existing_ld_outputs}/{total_ld_outputs}")
+        with c2:
+            st.metric("Mapped rsID variants", f"{mapped_variants}/{total_variants}")
+        with c3:
+            st.metric("LD-clumped variants", f"{clumped_variants}/{input_variants}")
+        with c4:
+            st.metric("Clumped MR significant rows", nominal_sig_rows)
 
-    interpretation_lines = []
+        st.markdown("---")
 
-    if mapped_variants > 0 and total_variants > 0:
-        mapping_rate = mapped_variants / total_variants
-        interpretation_lines.append(
-            f"Coordinate-based variants were mapped to rsID with an overall mapping rate of {mapping_rate:.2%} "
-            f"({mapped_variants}/{total_variants})."
-        )
+        # --------------------------------------------------------
+        # Quick interpretation
+        # --------------------------------------------------------
 
-    if input_variants > 0:
-        interpretation_lines.append(
-            f"LD clumping reduced the candidate instruments from {input_variants} mapped variants to {clumped_variants} independent variants."
-        )
+        st.subheader("1) Quick interpretation")
 
-    if len(ld_summary_df) > 0 and {"trait", "input_variants", "clumped_variants"}.issubset(set(ld_summary_df.columns)):
-        trait_parts = []
-        for _, row in ld_summary_df.iterrows():
-            trait_parts.append(
-                f"{row['trait']}: {int(row['input_variants'])} to {int(row['clumped_variants'])}"
-            )
-        interpretation_lines.append("Trait-level clumping result: " + "; ".join(trait_parts) + ".")
+        interpretation_lines = []
 
-    if len(clumped_run_df) > 0:
-        failed_clumped_runs = int((clumped_run_df["status"].astype(str).str.lower() == "failed").sum()) if "status" in clumped_run_df.columns else 0
-        interpretation_lines.append(
-            f"The clumped MR rerun produced {successful_clumped_runs} successful exposure-outcome runs and {failed_clumped_runs} failed runs."
-        )
-
-    if len(clumped_results_df) > 0:
-        traits = sorted(clumped_results_df["trait"].dropna().astype(str).unique().tolist()) if "trait" in clumped_results_df.columns else []
-        interpretation_lines.append(
-            f"The clumped combined MR table contains {len(clumped_results_df)} result rows for trait(s): {', '.join(traits)}."
-        )
-        if nominal_sig_rows == 0:
+        if mapped_variants > 0 and total_variants > 0:
+            mapping_rate = mapped_variants / total_variants
             interpretation_lines.append(
-                "No nominally significant association was detected in the LD-clumped MR results."
+                f"Coordinate-based variants were mapped to rsID with an overall mapping rate of {mapping_rate:.2%} "
+                f"({mapped_variants}/{total_variants})."
             )
+
+        if input_variants > 0:
+            interpretation_lines.append(
+                f"LD clumping reduced the candidate instruments from {input_variants} mapped variants to {clumped_variants} independent variants."
+            )
+
+        if len(ld_summary_df) > 0 and {"trait", "input_variants", "clumped_variants"}.issubset(set(ld_summary_df.columns)):
+            trait_parts = []
+            for _, row in ld_summary_df.iterrows():
+                trait_parts.append(
+                    f"{row['trait']}: {int(row['input_variants'])} to {int(row['clumped_variants'])}"
+                )
+            interpretation_lines.append("Trait-level clumping result: " + "; ".join(trait_parts) + ".")
+
+        if len(clumped_run_df) > 0:
+            failed_clumped_runs = int((clumped_run_df["status"].astype(str).str.lower() == "failed").sum()) if "status" in clumped_run_df.columns else 0
+            interpretation_lines.append(
+                f"The clumped MR rerun produced {successful_clumped_runs} successful exposure-outcome runs and {failed_clumped_runs} failed runs."
+            )
+
+        if len(clumped_results_df) > 0:
+            traits = sorted(clumped_results_df["trait"].dropna().astype(str).unique().tolist()) if "trait" in clumped_results_df.columns else []
+            interpretation_lines.append(
+                f"The clumped combined MR table contains {len(clumped_results_df)} result rows for trait(s): {', '.join(traits)}."
+            )
+            if nominal_sig_rows == 0:
+                interpretation_lines.append(
+                    "No nominally significant association was detected in the LD-clumped MR results."
+                )
+            else:
+                interpretation_lines.append(
+                    f"{nominal_sig_rows} result row(s) reached nominal significance at p < 0.05."
+                )
+
+        if len(interpretation_lines) == 0:
+            st.warning("LD clumping outputs are not available yet. Please run the LD clumping backend cells first.")
         else:
-            interpretation_lines.append(
-                f"{nominal_sig_rows} result row(s) reached nominal significance at p < 0.05."
-            )
+            st.info(" ".join(interpretation_lines))
 
-    if len(interpretation_lines) == 0:
-        st.warning("LD clumping outputs are not available yet. Please run the LD clumping backend cells first.")
-    else:
-        st.info(" ".join(interpretation_lines))
+        st.markdown(
+            """
+            Important note:
+            The previous coordinate-based MR results are retained as backend prototype outputs.
+            The updated LD clumping workflow is more formal because it maps coordinate-based variants to rsID,
+            performs LD clumping, and reruns MR using LD-clumped instruments.
+            However, after clumping, usable instruments are limited. GDF15 did not retain usable harmonised instruments,
+            while SHBG produced limited single-SNP Wald ratio results in the first three outcome candidates.
+            """
+        )
 
-    st.markdown(
-        """
-        Important note:
-        The previous coordinate-based MR results are retained as backend prototype outputs.
-        The updated LD clumping workflow is more formal because it maps coordinate-based variants to rsID,
-        performs LD clumping, and reruns MR using LD-clumped instruments.
-        However, after clumping, usable instruments are limited. GDF15 did not retain usable harmonised instruments,
-        while SHBG produced limited single-SNP Wald ratio results in the first three outcome candidates.
-        """
-    )
+        # --------------------------------------------------------
+        # Tabs
+        # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # Tabs
-    # --------------------------------------------------------
-
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "Pipeline status",
-        "rsID mapping",
-        "LD clumping",
-        "Clumped MR results",
-        "Report",
-        "Downloads"
-    ])
-
-    with tab1:
-        st.subheader("LD clumping output file status")
-        st.dataframe(ld_status_df, use_container_width=True)
-
-        st.subheader("Integrated MR pipeline steps")
-        pipeline_steps = pd.DataFrame([
-            {"step": "1", "pipeline_step": "Selected GRCh38 analysis set", "output": "analysis_set_record.csv", "status": "Completed"},
-            {"step": "2", "pipeline_step": "GWAS preprocessing and standardisation", "output": "backend_preprocessing_summary.csv", "status": "Completed"},
-            {"step": "3", "pipeline_step": "Significant variant selection", "output": "significant_variant_qc.csv", "status": "Completed"},
-            {"step": "4", "pipeline_step": "Coordinate-based variant to rsID mapping", "output": "rsid_mapping_summary.csv", "status": "Completed" if len(rsid_df) > 0 else "Not available"},
-            {"step": "5", "pipeline_step": "LD clumping", "output": "ld_clumping_summary.csv", "status": "Completed" if len(ld_summary_df) > 0 else "Not available"},
-            {"step": "6", "pipeline_step": "Clumped exposure-outcome SNP overlap", "output": "clumped_multi_outcome_snp_overlap.csv", "status": "Completed" if len(clumped_overlap_df) > 0 else "Not available"},
-            {"step": "7", "pipeline_step": "Clumped MR rerun", "output": "clumped_multi_outcome_combined_mr_results.csv", "status": "Completed" if len(clumped_results_df) > 0 else "Not available"},
-            {"step": "8", "pipeline_step": "Dashboard display and report generation", "output": "ld_clumping_improvement_report.md", "status": "Completed" if len(ld_report_text) > 0 else "Not available"},
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            "Pipeline status",
+            "rsID mapping",
+            "LD clumping",
+            "Clumped MR results",
+            "Report",
+            "Downloads"
         ])
-        st.dataframe(pipeline_steps, use_container_width=True)
 
-    with tab2:
-        st.subheader("rsID mapping summary")
-        if len(rsid_df) > 0:
-            st.dataframe(rsid_df, use_container_width=True)
-            _download_df(rsid_df, "rsid_mapping_summary.csv", "Download rsID mapping summary")
-        else:
-            st.warning("rsID mapping summary is not available.")
+        with tab1:
+            st.subheader("LD clumping output file status")
+            st.dataframe(ld_status_df, use_container_width=True)
 
-    with tab3:
-        st.subheader("LD clumping input summary")
-        if len(ld_input_df) > 0:
-            st.dataframe(ld_input_df, use_container_width=True)
-            _download_df(ld_input_df, "ld_clumping_input_summary.csv", "Download LD clumping input summary")
-        else:
-            st.warning("LD clumping input summary is not available.")
+            st.subheader("Integrated MR pipeline steps")
+            pipeline_steps = pd.DataFrame([
+                {"step": "1", "pipeline_step": "Selected GRCh38 analysis set", "output": "analysis_set_record.csv", "status": "Completed"},
+                {"step": "2", "pipeline_step": "GWAS preprocessing and standardisation", "output": "backend_preprocessing_summary.csv", "status": "Completed"},
+                {"step": "3", "pipeline_step": "Significant variant selection", "output": "significant_variant_qc.csv", "status": "Completed"},
+                {"step": "4", "pipeline_step": "Coordinate-based variant to rsID mapping", "output": "rsid_mapping_summary.csv", "status": "Completed" if len(rsid_df) > 0 else "Not available"},
+                {"step": "5", "pipeline_step": "LD clumping", "output": "ld_clumping_summary.csv", "status": "Completed" if len(ld_summary_df) > 0 else "Not available"},
+                {"step": "6", "pipeline_step": "Clumped exposure-outcome SNP overlap", "output": "clumped_multi_outcome_snp_overlap.csv", "status": "Completed" if len(clumped_overlap_df) > 0 else "Not available"},
+                {"step": "7", "pipeline_step": "Clumped MR rerun", "output": "clumped_multi_outcome_combined_mr_results.csv", "status": "Completed" if len(clumped_results_df) > 0 else "Not available"},
+                {"step": "8", "pipeline_step": "Dashboard display and report generation", "output": "ld_clumping_improvement_report.md", "status": "Completed" if len(ld_report_text) > 0 else "Not available"},
+            ])
+            st.dataframe(pipeline_steps, use_container_width=True)
 
-        st.subheader("LD clumping summary")
-        if len(ld_summary_df) > 0:
-            st.dataframe(ld_summary_df, use_container_width=True)
-            _download_df(ld_summary_df, "ld_clumping_summary.csv", "Download LD clumping summary")
-        else:
-            st.warning("LD clumping summary is not available.")
-
-        st.subheader("MR-ready clumped exposure summary")
-        if len(mr_ready_clumped_df) > 0:
-            st.dataframe(mr_ready_clumped_df, use_container_width=True)
-            _download_df(mr_ready_clumped_df, "mr_ready_clumped_exposure_summary.csv", "Download MR-ready clumped exposure summary")
-        else:
-            st.warning("MR-ready clumped exposure summary is not available.")
-
-    with tab4:
-        st.subheader("Clumped exposure-outcome SNP overlap")
-        if len(clumped_overlap_df) > 0:
-            st.dataframe(clumped_overlap_df, use_container_width=True)
-            _download_df(clumped_overlap_df, "clumped_multi_outcome_snp_overlap.csv", "Download clumped SNP overlap")
-        else:
-            st.warning("Clumped SNP overlap file is not available.")
-
-        st.subheader("Clumped MR run summary")
-        if len(clumped_run_df) > 0:
-            st.dataframe(clumped_run_df, use_container_width=True)
-            _download_df(clumped_run_df, "clumped_multi_outcome_mr_run_summary.csv", "Download clumped MR run summary")
-        else:
-            st.warning("Clumped MR run summary is not available.")
-
-        st.subheader("Clumped combined MR results")
-        if len(clumped_results_df) > 0:
-            filtered_df = clumped_results_df.copy()
-
-            filter_cols = st.columns(3)
-
-            with filter_cols[0]:
-                if "trait" in filtered_df.columns:
-                    trait_options = ["All"] + sorted(filtered_df["trait"].dropna().astype(str).unique().tolist())
-                    selected_trait = st.selectbox("Filter by trait", trait_options, key="clumped_result_trait_filter")
-                    if selected_trait != "All":
-                        filtered_df = filtered_df[filtered_df["trait"].astype(str) == selected_trait]
-
-            with filter_cols[1]:
-                if "method" in filtered_df.columns:
-                    method_options = ["All"] + sorted(filtered_df["method"].dropna().astype(str).unique().tolist())
-                    selected_method = st.selectbox("Filter by method", method_options, key="clumped_result_method_filter")
-                    if selected_method != "All":
-                        filtered_df = filtered_df[filtered_df["method"].astype(str) == selected_method]
-
-            with filter_cols[2]:
-                simplified = st.checkbox("Show simplified columns", value=True, key="clumped_result_simplified_cols")
-
-            if "pval" in filtered_df.columns:
-                filtered_df["pval"] = pd.to_numeric(filtered_df["pval"], errors="coerce")
-                filtered_df = filtered_df.sort_values("pval", ascending=True)
-
-            if simplified:
-                primary_cols = [
-                    "set_name",
-                    "trait",
-                    "method",
-                    "nsnp",
-                    "b",
-                    "se",
-                    "pval",
-                    "MR_OR",
-                    "MR_OR_lower_95CI",
-                    "MR_OR_upper_95CI",
-                    "nominal_significant",
-                    "harmonised_snps",
-                    "instrument_selection",
-                    "overlap_snps"
-                ]
-                display_cols = [c for c in primary_cols if c in filtered_df.columns]
-                st.dataframe(filtered_df[display_cols], use_container_width=True)
+        with tab2:
+            st.subheader("rsID mapping summary")
+            if len(rsid_df) > 0:
+                st.dataframe(rsid_df, use_container_width=True)
+                _download_df(rsid_df, "rsid_mapping_summary.csv", "Download rsID mapping summary")
             else:
-                st.dataframe(filtered_df, use_container_width=True)
+                st.warning("rsID mapping summary is not available.")
 
-            _download_df(filtered_df, "filtered_clumped_multi_outcome_mr_results.csv", "Download filtered clumped MR results")
-
-            st.markdown("Interpretation guide:")
-            st.write(
-                "The LD-clumped MR results are more conservative than the previous coordinate-based prototype results. "
-                "SHBG currently has single-SNP Wald ratio results only, while GDF15 did not retain usable harmonised instruments after clumping. "
-                "Wide confidence intervals should be interpreted as limited statistical stability."
-            )
-        else:
-            st.warning("Clumped combined MR results are not available.")
-
-    with tab5:
-        st.subheader("LD clumping improvement report")
-        if ld_report_text:
-            view_mode = st.radio(
-                "Report display mode",
-                ["Readable text", "Rendered markdown"],
-                horizontal=True,
-                key="ld_report_view_mode"
-            )
-            if view_mode == "Readable text":
-                st.text_area("Full LD clumping report markdown text", value=ld_report_text, height=650)
+        with tab3:
+            st.subheader("LD clumping input summary")
+            if len(ld_input_df) > 0:
+                st.dataframe(ld_input_df, use_container_width=True)
+                _download_df(ld_input_df, "ld_clumping_input_summary.csv", "Download LD clumping input summary")
             else:
-                st.markdown(ld_report_text)
-            _download_text(ld_report_text, "ld_clumping_improvement_report.md", "Download LD clumping improvement report")
-        else:
-            st.info("LD clumping improvement report is not available.")
+                st.warning("LD clumping input summary is not available.")
 
-    with tab6:
-        st.subheader("Available LD clumping result files")
-        st.dataframe(ld_status_df, use_container_width=True)
+            st.subheader("LD clumping summary")
+            if len(ld_summary_df) > 0:
+                st.dataframe(ld_summary_df, use_container_width=True)
+                _download_df(ld_summary_df, "ld_clumping_summary.csv", "Download LD clumping summary")
+            else:
+                st.warning("LD clumping summary is not available.")
 
-        if len(rsid_df) > 0:
-            _download_df(rsid_df, "rsid_mapping_summary.csv", "Download rsID mapping summary")
-        if len(ld_summary_df) > 0:
-            _download_df(ld_summary_df, "ld_clumping_summary.csv", "Download LD clumping summary")
-        if len(clumped_overlap_df) > 0:
-            _download_df(clumped_overlap_df, "clumped_multi_outcome_snp_overlap.csv", "Download clumped SNP overlap")
-        if len(clumped_run_df) > 0:
-            _download_df(clumped_run_df, "clumped_multi_outcome_mr_run_summary.csv", "Download clumped MR run summary")
-        if len(clumped_results_df) > 0:
-            _download_df(clumped_results_df, "clumped_multi_outcome_combined_mr_results.csv", "Download clumped combined MR results")
-        if ld_report_text:
-            _download_text(ld_report_text, "ld_clumping_improvement_report.md", "Download LD clumping report")
+            st.subheader("MR-ready clumped exposure summary")
+            if len(mr_ready_clumped_df) > 0:
+                st.dataframe(mr_ready_clumped_df, use_container_width=True)
+                _download_df(mr_ready_clumped_df, "mr_ready_clumped_exposure_summary.csv", "Download MR-ready clumped exposure summary")
+            else:
+                st.warning("MR-ready clumped exposure summary is not available.")
+
+        with tab4:
+            st.subheader("Clumped exposure-outcome SNP overlap")
+            if len(clumped_overlap_df) > 0:
+                st.dataframe(clumped_overlap_df, use_container_width=True)
+                _download_df(clumped_overlap_df, "clumped_multi_outcome_snp_overlap.csv", "Download clumped SNP overlap")
+            else:
+                st.warning("Clumped SNP overlap file is not available.")
+
+            st.subheader("Clumped MR run summary")
+            if len(clumped_run_df) > 0:
+                st.dataframe(clumped_run_df, use_container_width=True)
+                _download_df(clumped_run_df, "clumped_multi_outcome_mr_run_summary.csv", "Download clumped MR run summary")
+            else:
+                st.warning("Clumped MR run summary is not available.")
+
+            st.subheader("Clumped combined MR results")
+            if len(clumped_results_df) > 0:
+                filtered_df = clumped_results_df.copy()
+
+                filter_cols = st.columns(3)
+
+                with filter_cols[0]:
+                    if "trait" in filtered_df.columns:
+                        trait_options = ["All"] + sorted(filtered_df["trait"].dropna().astype(str).unique().tolist())
+                        selected_trait = st.selectbox("Filter by trait", trait_options, key="clumped_result_trait_filter")
+                        if selected_trait != "All":
+                            filtered_df = filtered_df[filtered_df["trait"].astype(str) == selected_trait]
+
+                with filter_cols[1]:
+                    if "method" in filtered_df.columns:
+                        method_options = ["All"] + sorted(filtered_df["method"].dropna().astype(str).unique().tolist())
+                        selected_method = st.selectbox("Filter by method", method_options, key="clumped_result_method_filter")
+                        if selected_method != "All":
+                            filtered_df = filtered_df[filtered_df["method"].astype(str) == selected_method]
+
+                with filter_cols[2]:
+                    simplified = st.checkbox("Show simplified columns", value=True, key="clumped_result_simplified_cols")
+
+                if "pval" in filtered_df.columns:
+                    filtered_df["pval"] = pd.to_numeric(filtered_df["pval"], errors="coerce")
+                    filtered_df = filtered_df.sort_values("pval", ascending=True)
+
+                if simplified:
+                    primary_cols = [
+                        "set_name",
+                        "trait",
+                        "method",
+                        "nsnp",
+                        "b",
+                        "se",
+                        "pval",
+                        "MR_OR",
+                        "MR_OR_lower_95CI",
+                        "MR_OR_upper_95CI",
+                        "nominal_significant",
+                        "harmonised_snps",
+                        "instrument_selection",
+                        "overlap_snps"
+                    ]
+                    display_cols = [c for c in primary_cols if c in filtered_df.columns]
+                    st.dataframe(filtered_df[display_cols], use_container_width=True)
+                else:
+                    st.dataframe(filtered_df, use_container_width=True)
+
+                _download_df(filtered_df, "filtered_clumped_multi_outcome_mr_results.csv", "Download filtered clumped MR results")
+
+                st.markdown("Interpretation guide:")
+                st.write(
+                    "The LD-clumped MR results are more conservative than the previous coordinate-based prototype results. "
+                    "SHBG currently has single-SNP Wald ratio results only, while GDF15 did not retain usable harmonised instruments after clumping. "
+                    "Wide confidence intervals should be interpreted as limited statistical stability."
+                )
+            else:
+                st.warning("Clumped combined MR results are not available.")
+
+        with tab5:
+            st.subheader("LD clumping improvement report")
+            if ld_report_text:
+                view_mode = st.radio(
+                    "Report display mode",
+                    ["Readable text", "Rendered markdown"],
+                    horizontal=True,
+                    key="ld_report_view_mode"
+                )
+                if view_mode == "Readable text":
+                    st.text_area("Full LD clumping report markdown text", value=ld_report_text, height=650)
+                else:
+                    st.markdown(ld_report_text)
+                _download_text(ld_report_text, "ld_clumping_improvement_report.md", "Download LD clumping improvement report")
+            else:
+                st.info("LD clumping improvement report is not available.")
+
+        with tab6:
+            st.subheader("Available LD clumping result files")
+            st.dataframe(ld_status_df, use_container_width=True)
+
+            if len(rsid_df) > 0:
+                _download_df(rsid_df, "rsid_mapping_summary.csv", "Download rsID mapping summary")
+            if len(ld_summary_df) > 0:
+                _download_df(ld_summary_df, "ld_clumping_summary.csv", "Download LD clumping summary")
+            if len(clumped_overlap_df) > 0:
+                _download_df(clumped_overlap_df, "clumped_multi_outcome_snp_overlap.csv", "Download clumped SNP overlap")
+            if len(clumped_run_df) > 0:
+                _download_df(clumped_run_df, "clumped_multi_outcome_mr_run_summary.csv", "Download clumped MR run summary")
+            if len(clumped_results_df) > 0:
+                _download_df(clumped_results_df, "clumped_multi_outcome_combined_mr_results.csv", "Download clumped combined MR results")
+            if ld_report_text:
+                _download_text(ld_report_text, "ld_clumping_improvement_report.md", "Download LD clumping report")
 
 
 
@@ -2168,6 +3563,12 @@ if page == "CPI / GNN Exploration":
         "Quick test predictions": CPI_QUICK_TEST_PREDICTIONS_FILE,
         "Artesunate SMILES": CPI_ARTESUNATE_SMILES_FILE,
         "Candidate protein target template": CPI_CANDIDATE_TARGET_TEMPLATE_FILE,
+        "Artesunate-target predictions (P2)": CPI_TARGET_PREDICTIONS_FILE,
+        "P2 holdout manifest": CPI_HOLDOUT_MANIFEST_FILE,
+        "P2 training log": CPI_P2_TRAINING_LOG_FILE,
+        "Artesunate 3D conformer (SDF)": CPI_3D_CONFORMER_SDF_FILE,
+        "Artesunate 3D conformer metadata": CPI_3D_CONFORMER_METADATA_FILE,
+        "Artesunate 3D heavy-atom coordinates": CPI_3D_COORDS_FILE,
     }
 
     cpi_status_records = []
@@ -2193,6 +3594,13 @@ if page == "CPI / GNN Exploration":
     cpi_summary_text = _cpi_read_text(CPI_EXPLORATION_SUMMARY_FILE)
     cpi_train_log = _cpi_read_text(CPI_QUICK_TRAINING_LOG_FILE)
     cpi_eval_log = _cpi_read_text(CPI_QUICK_EVALUATION_LOG_FILE)
+
+    # P2 additions.
+    cpi_target_predictions_df = _cpi_read_csv(CPI_TARGET_PREDICTIONS_FILE)
+    cpi_3d_metadata_df = _cpi_read_csv(CPI_3D_CONFORMER_METADATA_FILE)
+    cpi_3d_coords_df = _cpi_read_csv(CPI_3D_COORDS_FILE)
+    cpi_p2_train_log = _cpi_read_text(CPI_P2_TRAINING_LOG_FILE)
+
 
     existing_outputs = int(cpi_status_df["exists"].sum()) if len(cpi_status_df) > 0 else 0
     total_outputs = len(cpi_status_df)
@@ -2252,14 +3660,16 @@ if page == "CPI / GNN Exploration":
         """
     )
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "Pipeline status",
         "Quick metrics",
         "Confusion matrix",
         "Compound and targets",
         "Summary report",
-        "Downloads"
+        "Downloads",
+        "Artesunate-target prediction (P2)"
     ])
+
 
     with tab1:
         st.subheader("CPI exploration output status")
@@ -2275,8 +3685,13 @@ if page == "CPI / GNN Exploration":
             {"step": "6", "pipeline_step": "Quick classification evaluation", "output": "metrics/confusion matrix/report", "status": "Completed" if CPI_QUICK_EVALUATION_METRICS_FILE.exists() else "Not available"},
             {"step": "7", "pipeline_step": "Prepare Artesunate SMILES", "output": "artesunate_smiles_pubchem.csv", "status": "Completed" if CPI_ARTESUNATE_SMILES_FILE.exists() else "Not available"},
             {"step": "8", "pipeline_step": "Prepare candidate target template", "output": "candidate_protein_target_template.csv", "status": "Completed" if CPI_CANDIDATE_TARGET_TEMPLATE_FILE.exists() else "Not available"},
+            {"step": "9 (P2)", "pipeline_step": "Fetch verified UniProt protein sequences", "output": "candidate_protein_target_template.csv (filled in)", "status": "Completed" if (len(cpi_targets_df) > 0 and cpi_targets_df.get("protein_sequence", pd.Series(dtype=str)).astype(str).str.len().gt(0).any()) else "Not available"},
+            {"step": "10 (P2)", "pipeline_step": "Generate Artesunate 3D conformer", "output": "artesunate_3d_conformer.sdf + metadata", "status": "Completed" if CPI_3D_CONFORMER_SDF_FILE.exists() else "Not available"},
+            {"step": "11 (P2)", "pipeline_step": "Rebuild dataset + preprocess with real pairs", "output": "human_p2 input tensors", "status": "Completed" if CPI_HOLDOUT_MANIFEST_FILE.exists() else "Not available"},
+            {"step": "12 (P2)", "pipeline_step": "Retrain model and run inference on real pairs", "output": "artesunate_target_predictions.csv", "status": "Completed" if CPI_TARGET_PREDICTIONS_FILE.exists() else "Not available"},
         ])
         st.dataframe(cpi_pipeline_steps, use_container_width=True)
+
 
     with tab2:
         st.subheader("Quick evaluation metrics")
@@ -2341,20 +3756,43 @@ if page == "CPI / GNN Exploration":
         else:
             st.warning("Artesunate SMILES file is not available.")
 
+        st.subheader("Artesunate 3D conformer (P2)")
+        if len(cpi_3d_metadata_df) > 0:
+            st.dataframe(cpi_3d_metadata_df, use_container_width=True)
+            if CPI_3D_CONFORMER_SDF_FILE.exists():
+                st.download_button(
+                    label="Download 3D conformer (SDF)",
+                    data=CPI_3D_CONFORMER_SDF_FILE.read_bytes(),
+                    file_name="artesunate_3d_conformer.sdf",
+                    mime="chemical/x-mdl-sdfile",
+                    key=make_unique_cpi_download_key("cpi_file", "3d_sdf", "artesunate_3d_conformer.sdf")
+                )
+            if len(cpi_3d_coords_df) > 0:
+                with st.expander("Heavy-atom 3D coordinates", expanded=False):
+                    st.dataframe(cpi_3d_coords_df, use_container_width=True)
+                    _cpi_download_df(cpi_3d_coords_df, "artesunate_3d_heavy_atom_coords.csv", "Download 3D coordinates")
+        else:
+            st.info("No 3D conformer generated yet. This is optional data for a future 3D-aware compound encoder -- the current CPI model does not consume it.")
+
         st.subheader("Candidate protein target template")
         if len(cpi_targets_df) > 0:
             st.dataframe(cpi_targets_df, use_container_width=True)
             _cpi_download_df(cpi_targets_df, "candidate_protein_target_template.csv", "Download candidate target template")
+
+            has_real_sequences = cpi_targets_df.get("protein_sequence", pd.Series(dtype=str)).astype(str).str.len().gt(0).any()
+            if not has_real_sequences:
+                st.markdown(
+                    """
+                    Next step:
+                    Fill in verified human protein sequences for candidate targets such as SHBG, GDF15, IGF1, and ADIPOQ.
+                    After protein sequences are available, a future prediction input table can be created using Artesunate SMILES + target protein sequence pairs.
+                    """
+                )
+            else:
+                st.success("Verified UniProt protein sequences are filled in for the target(s) above. See the 'Artesunate-target prediction (P2)' tab for inference results.")
         else:
             st.warning("Candidate protein target template is not available.")
 
-        st.markdown(
-            """
-            Next step:
-            Fill in verified human protein sequences for candidate targets such as SHBG, GDF15, IGF1, and ADIPOQ.
-            After protein sequences are available, a future prediction input table can be created using Artesunate SMILES + target protein sequence pairs.
-            """
-        )
 
     with tab5:
         st.subheader("CPI / GNN exploration summary report")
@@ -2405,4 +3843,61 @@ if page == "CPI / GNN Exploration":
             _cpi_download_df(cpi_targets_df, "candidate_protein_target_template.csv", "Download target template")
         if cpi_summary_text:
             _cpi_download_text(cpi_summary_text, "cpi_gnn_exploration_summary.md", "Download CPI summary report")
+        if len(cpi_target_predictions_df) > 0:
+            _cpi_download_df(cpi_target_predictions_df, "artesunate_target_predictions.csv", "Download Artesunate-target predictions (P2)")
+        if len(cpi_3d_metadata_df) > 0:
+            _cpi_download_df(cpi_3d_metadata_df, "artesunate_3d_conformer_metadata.csv", "Download 3D conformer metadata")
+        if len(cpi_3d_coords_df) > 0:
+            _cpi_download_df(cpi_3d_coords_df, "artesunate_3d_heavy_atom_coords.csv", "Download 3D coordinates")
+        if cpi_p2_train_log:
+            _cpi_download_text(cpi_p2_train_log, "p2_training_log.txt", "Download P2 training log")
 
+    with tab7:
+        st.subheader("Artesunate-target exploratory inference (P2)")
+
+        if len(cpi_target_predictions_df) == 0:
+            st.info(
+                "No P2 inference results yet. This tab will populate after the P2 notebook "
+                "cells are run: verified UniProt sequences -> Artesunate 3D conformer -> "
+                "rebuild dataset with real pairs -> retrain -> inference."
+            )
+        else:
+            st.warning(
+                "Exploratory inference only -- a small number of Artesunate-target pairs, "
+                "no negative controls, and no ground-truth interaction label for Artesunate "
+                "itself. Read these scores as one supplementary, model-derived signal "
+                "alongside the MR causal evidence on this dashboard, not as a validated "
+                "prediction of biological interaction."
+            )
+
+            display_cols = [c for c in [
+                "target_name", "gene_symbol", "uniprot_id",
+                "interaction_probability", "predicted_label", "benchmark_test_auc"
+            ] if c in cpi_target_predictions_df.columns]
+
+            st.dataframe(
+                cpi_target_predictions_df[display_cols].sort_values("interaction_probability", ascending=False),
+                use_container_width=True
+            )
+
+            try:
+                chart_df = cpi_target_predictions_df.set_index("target_name")[["interaction_probability"]]
+                st.bar_chart(chart_df)
+            except Exception as e:
+                st.info(f"Chart rendering skipped: {e}")
+
+            if "benchmark_test_auc" in cpi_target_predictions_df.columns and len(cpi_target_predictions_df) > 0:
+                st.caption(
+                    f"Model trained on the benchmark subset reached a test AUC of "
+                    f"{cpi_target_predictions_df.iloc[0]['benchmark_test_auc']} before this "
+                    f"inference was run (see the 'Quick metrics' tab style summary in the P2 "
+                    f"training log below for the full curve)."
+                )
+
+            _cpi_download_df(cpi_target_predictions_df, "artesunate_target_predictions.csv", "Download predictions")
+
+            with st.expander("P2 training log", expanded=False):
+                if cpi_p2_train_log:
+                    st.text_area("p2_training_log.txt", value=cpi_p2_train_log, height=300)
+                else:
+                    st.info("P2 training log is not available.")
