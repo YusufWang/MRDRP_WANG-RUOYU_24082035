@@ -1,0 +1,29 @@
+Evaluation uses device: cuda
+Input dir: /content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/dataset/human_quick/input/radius2_ngram3
+Model file: /content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/output/model/human_quick--quick--radius2--ngram3--dim10--layer_gnn1--window11--layer_cnn1--layer_output1--lr1e-3--lr_decay0.5--decay_interval10--weight_decay1e-6--iteration3
+Train/dev/test sizes: 240 30 30
+
+Evaluation metrics:
+   accuracy  precision  ...  positive_true_count  positive_pred_count
+0  0.833333   0.823529  ...                   16                   17
+
+[1 rows x 8 columns]
+
+Confusion matrix:
+                          Pred_0_non_interaction  Pred_1_interaction
+Actual_0_non_interaction                      11                   3
+Actual_1_interaction                           2                  14
+
+Classification report:
+                 precision    recall  f1-score    support
+non_interaction   0.846154  0.785714  0.814815  14.000000
+interaction       0.823529  0.875000  0.848485  16.000000
+accuracy          0.833333  0.833333  0.833333   0.833333
+macro avg         0.834842  0.830357  0.831650  30.000000
+weighted avg      0.834087  0.833333  0.832772  30.000000
+
+Saved files:
+/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/output/evaluation/quick_test_predictions.csv
+/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/output/evaluation/quick_confusion_matrix.csv
+/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/output/evaluation/quick_classification_report.csv
+/content/drive/MyDrive/UM_WQF7023/CPI_3D_GNN_Exploration/CPI_prediction/output/evaluation/quick_evaluation_metrics.csv
