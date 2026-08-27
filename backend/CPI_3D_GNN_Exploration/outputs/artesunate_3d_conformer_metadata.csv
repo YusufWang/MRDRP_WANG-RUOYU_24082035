@@ -1,2 +1,0 @@
-compound_name,source_smiles,embedding_method,n_conformers_attempted,n_conformers_embedded,optimization_method,best_conformer_id,best_mmff_energy_kcal_mol,n_atoms_with_h,n_heavy_atoms,generated_at
-Artesunate,C[C@@H]1CC[C@H]2[C@H]([C@@H](O[C@H]3[C@@]24[C@H]1CC[C@](O3)(OO4)C)OC(=O)CCC(=O)O)C,RDKit ETKDGv3,20,20,MMFF94,6,11.676,55,27,2026-08-07 01:00:58
