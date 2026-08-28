@@ -10,7 +10,7 @@ Developed for the WQF7023 AI Research Project, Master of Artificial Intelligence
 
 ## Live Dashboard
 
-**[https://measured-hazards-cindy-revised.trycloudflare.com/)**
+**[https://measured-hazards-cindy-revised.trycloudflare.com/]**
 
 This is a live, working deployment on a university lab server — not a static demo. All features described below are fully functional at this link, including live GWAS Catalog search, file screening, and one-click MR analysis with real-time progress.
 
